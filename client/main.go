@@ -24,7 +24,6 @@ var serverPort string
 type ActiveRequest struct {
 	RawHTTPData *bytes.Buffer
 	ID          string
-	TotalSize   int
 	mu          sync.Mutex
 	nextChunk   int
 	chunkCond   *sync.Cond
@@ -179,17 +178,17 @@ func (sc *ServiceClient) processMessage(rawMsg json.RawMessage) {
 	log.Printf("In processMessage ID = %s type = %s", msgType.ID, msgType.Type)
 
 	switch msgType.Type {
-	case "raw_request_start":
+	case "raw_http_request_start":
 		var reqStart protocol.ProxyRawRequestStart
 		json.Unmarshal(rawMsg, &reqStart)
 		sc.handleRawRequestStart(reqStart)
 
-	case "raw_request_chunk":
+	case "raw_http_request_chunk":
 		var reqChunk protocol.ProxyRawRequestChunk
 		json.Unmarshal(rawMsg, &reqChunk)
 		sc.handleRawRequestChunk(reqChunk)
 
-	case "raw_request_end":
+	case "raw_http_request_end":
 		var reqEnd protocol.ProxyRawRequestEnd
 		json.Unmarshal(rawMsg, &reqEnd)
 		sc.handleRawRequestEnd(reqEnd)
@@ -197,11 +196,6 @@ func (sc *ServiceClient) processMessage(rawMsg json.RawMessage) {
 }
 
 func (sc *ServiceClient) handleRawRequestStart(reqStart protocol.ProxyRawRequestStart) {
-	sc.reqMu.Lock()
-	activeReq := sc.activeReqs[reqStart.ID]
-	sc.reqMu.Unlock()
-
-	activeReq.TotalSize = reqStart.TotalSize
 }
 
 func (sc *ServiceClient) handleRawRequestChunk(chunk protocol.ProxyRawRequestChunk) {

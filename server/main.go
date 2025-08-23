@@ -286,7 +286,7 @@ func (ps *ProxyServer) handleHTTPProxy(w http.ResponseWriter, r *http.Request) {
 
 	// Send request start with total size
 	reqStart := protocol.ProxyRawRequestStart{
-		Type:      "raw_request_start",
+		Type:      "raw_http_request_start",
 		ID:        reqID,
 		TotalSize: totalSize,
 		ChunkNum:  chunkNum,
@@ -313,7 +313,7 @@ func (ps *ProxyServer) handleHTTPProxy(w http.ResponseWriter, r *http.Request) {
 		}
 
 		chunk := protocol.ProxyRawRequestChunk{
-			Type:     "raw_request_chunk",
+			Type:     "raw_http_request_chunk",
 			ID:       reqID,
 			Data:     base64.StdEncoding.EncodeToString(requestData[offset:end]),
 			ChunkNum: chunkNum,
@@ -332,7 +332,7 @@ func (ps *ProxyServer) handleHTTPProxy(w http.ResponseWriter, r *http.Request) {
 
 	// Send request end
 	reqEnd := protocol.ProxyRawRequestEnd{
-		Type:     "raw_request_end",
+		Type:     "raw_http_request_end",
 		ID:       reqID,
 		ChunkNum: chunkNum,
 	}
