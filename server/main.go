@@ -284,18 +284,18 @@ func (ps *ProxyServer) handleHTTPProxy(w http.ResponseWriter, r *http.Request) {
 	requestData := requestDump
 	totalSize := len(requestData)
 
-	// Send request start with total size
-	reqStart := protocol.ProxyRawRequestStart{
-		Type:      "raw_http_request_start",
-		ID:        reqID,
-		TotalSize: totalSize,
-		ChunkNum:  chunkNum,
-	}
-	chunkNum++
+	// // Send request start with total size
+	// reqStart := protocol.ProxyRawRequestStart{
+	// 	Type:      "raw_http_request_start",
+	// 	ID:        reqID,
+	// 	TotalSize: totalSize,
+	// 	ChunkNum:  chunkNum,
+	// }
+	// chunkNum++
 
-	service.mu.Lock()
-	err = service.conn.WriteJSON(reqStart)
-	service.mu.Unlock()
+	// service.mu.Lock()
+	// err = service.conn.WriteJSON(reqStart)
+	// service.mu.Unlock()
 
 	if err != nil {
 		ps.reqMu.Lock()
@@ -308,14 +308,17 @@ func (ps *ProxyServer) handleHTTPProxy(w http.ResponseWriter, r *http.Request) {
 	// Send data in chunks
 	for offset := 0; offset < totalSize; offset += protocol.ChunkSize {
 		end := offset + protocol.ChunkSize
-		if end > totalSize {
+		EOS := false
+		if end >= totalSize {
+			EOS = true
 			end = totalSize
 		}
 
-		chunk := protocol.ProxyRawRequestChunk{
-			Type:     "raw_http_request_chunk",
+		chunk := protocol.ProxyRawRequestChunkWithEOS{
+			Type:     "raw_http_request_chunk_with_eos",
 			ID:       reqID,
 			Data:     base64.StdEncoding.EncodeToString(requestData[offset:end]),
+			EOS:      EOS,
 			ChunkNum: chunkNum,
 		}
 
@@ -331,15 +334,15 @@ func (ps *ProxyServer) handleHTTPProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Send request end
-	reqEnd := protocol.ProxyRawRequestEnd{
-		Type:     "raw_http_request_end",
-		ID:       reqID,
-		ChunkNum: chunkNum,
-	}
+	// reqEnd := protocol.ProxyRawRequestEnd{
+	// 	Type:     "raw_http_request_end",
+	// 	ID:       reqID,
+	// 	ChunkNum: chunkNum,
+	// }
 
-	service.mu.Lock()
-	service.conn.WriteJSON(reqEnd)
-	service.mu.Unlock()
+	// service.mu.Lock()
+	// service.conn.WriteJSON(reqEnd)
+	// service.mu.Unlock()
 
 	// Set up timeout cleanup
 	ps.processResponse(w, activeResp.ResponseChan)

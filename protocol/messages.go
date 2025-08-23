@@ -77,6 +77,13 @@ type ProxyRawRequestChunk struct {
 	Data     string `json:"data"` // base64 encoded chunk
 	ChunkNum int    `json:"chunk_num"`
 }
+type ProxyRawRequestChunkWithEOS struct {
+	Type     string `json:"type"`
+	ID       string `json:"id"`
+	EOS      bool   `json:"eos"`
+	Data     string `json:"data"` // base64 encoded chunk
+	ChunkNum int    `json:"chunk_num"`
+}
 
 type ProxyRawRequestEnd struct {
 	Type     string `json:"type"`

@@ -178,27 +178,49 @@ func (sc *ServiceClient) processMessage(rawMsg json.RawMessage) {
 	log.Printf("In processMessage ID = %s type = %s", msgType.ID, msgType.Type)
 
 	switch msgType.Type {
-	case "raw_http_request_start":
-		var reqStart protocol.ProxyRawRequestStart
-		json.Unmarshal(rawMsg, &reqStart)
-		sc.handleRawRequestStart(reqStart)
+	// case "raw_http_request_start":
+	// 	var reqStart protocol.ProxyRawRequestStart
+	// 	json.Unmarshal(rawMsg, &reqStart)
+	// 	sc.handleRawRequestStart(reqStart)
 
-	case "raw_http_request_chunk":
-		var reqChunk protocol.ProxyRawRequestChunk
+	// case "raw_http_request_chunk":
+	// 	var reqChunk protocol.ProxyRawRequestChunk
+	// 	json.Unmarshal(rawMsg, &reqChunk)
+	// 	sc.handleRawRequestChunk(reqChunk)
+	case "raw_http_request_chunk_with_eos":
+		var reqChunk protocol.ProxyRawRequestChunkWithEOS
 		json.Unmarshal(rawMsg, &reqChunk)
-		sc.handleRawRequestChunk(reqChunk)
+		sc.handleRawRequestChunkWithEOS(reqChunk)
 
-	case "raw_http_request_end":
-		var reqEnd protocol.ProxyRawRequestEnd
-		json.Unmarshal(rawMsg, &reqEnd)
-		sc.handleRawRequestEnd(reqEnd)
+		// case "raw_http_request_end":
+		// 	var reqEnd protocol.ProxyRawRequestEnd
+		// 	json.Unmarshal(rawMsg, &reqEnd)
+		// 	sc.handleRawRequestEnd(reqEnd)
 	}
 }
 
-func (sc *ServiceClient) handleRawRequestStart(reqStart protocol.ProxyRawRequestStart) {
-}
+// func (sc *ServiceClient) handleRawRequestStart(reqStart protocol.ProxyRawRequestStart) {
+// }
 
-func (sc *ServiceClient) handleRawRequestChunk(chunk protocol.ProxyRawRequestChunk) {
+// func (sc *ServiceClient) handleRawRequestChunk(chunk protocol.ProxyRawRequestChunk) {
+// 	sc.reqMu.RLock()
+// 	activeReq := sc.activeReqs[chunk.ID]
+// 	sc.reqMu.RUnlock()
+
+// 	if chunk.Data != "" {
+// 		data, err := base64.StdEncoding.DecodeString(chunk.Data)
+// 		if err != nil {
+// 			log.Printf("Failed to decode chunk: %v", err)
+// 			return
+// 		}
+
+// 		activeReq.mu.Lock()
+// 		activeReq.RawHTTPData.Write(data)
+// 		activeReq.mu.Unlock()
+// 	}
+// }
+
+func (sc *ServiceClient) handleRawRequestChunkWithEOS(chunk protocol.ProxyRawRequestChunkWithEOS) {
 	sc.reqMu.RLock()
 	activeReq := sc.activeReqs[chunk.ID]
 	sc.reqMu.RUnlock()
@@ -213,6 +235,20 @@ func (sc *ServiceClient) handleRawRequestChunk(chunk protocol.ProxyRawRequestChu
 		activeReq.mu.Lock()
 		activeReq.RawHTTPData.Write(data)
 		activeReq.mu.Unlock()
+	}
+
+	if chunk.EOS {
+
+		sc.reqMu.RLock()
+		activeReq = sc.activeReqs[chunk.ID]
+		sc.reqMu.RUnlock()
+
+		sc.executeRawRequest(activeReq)
+
+		sc.reqMu.Lock()
+		delete(sc.activeReqs, chunk.ID)
+		sc.reqMu.Unlock()
+
 	}
 }
 
