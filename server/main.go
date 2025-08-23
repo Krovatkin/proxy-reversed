@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -29,32 +30,20 @@ type ServiceConnection struct {
 	mu        sync.RWMutex
 }
 
-type ResponseMessage struct {
-	Type  string
-	Data  interface{}
-	Error error
-}
-
 type PendingResponse struct {
 	ResponseWriter http.ResponseWriter
 	StartTime      time.Time
-	ResponseChan   chan ResponseMessage
+	ResponseChan   chan json.RawMessage
 	ID             string
-	mu             sync.Mutex
-	nextChunk      int
-	chunkCond      *sync.Cond
 }
 
 func NewPendingResponse(requestID string, w http.ResponseWriter) *PendingResponse {
-	resp := &PendingResponse{
+	return &PendingResponse{
 		ResponseWriter: w,
 		StartTime:      time.Now(),
-		ResponseChan:   make(chan ResponseMessage, 10),
+		ResponseChan:   make(chan json.RawMessage, 10),
 		ID:             requestID,
-		nextChunk:      0,
 	}
-	resp.chunkCond = sync.NewCond(&resp.mu)
-	return resp
 }
 
 type ProxyServer struct {
@@ -75,6 +64,25 @@ func NewProxyServer() *ProxyServer {
 		},
 		pendingReqs: make(map[string]*PendingResponse),
 	}
+}
+
+// Fast ID extraction without full JSON parsing
+func fastExtractID(data []byte) string {
+	// Look for `"id":"` pattern
+	idPattern := []byte(`"id":"`)
+	start := bytes.Index(data, idPattern)
+	if start == -1 {
+		return ""
+	}
+	start += len(idPattern)
+
+	// Find closing quote
+	end := bytes.IndexByte(data[start:], '"')
+	if end == -1 {
+		return ""
+	}
+
+	return string(data[start : start+end])
 }
 
 func (ps *ProxyServer) handleServiceRegistration(w http.ResponseWriter, r *http.Request) {
@@ -133,18 +141,7 @@ func (ps *ProxyServer) handleServiceRegistration(w http.ResponseWriter, r *http.
 			break
 		}
 
-		var baseResp protocol.ProxyBaseMessage
-		err = json.Unmarshal(rawMsg, &baseResp)
-		if err != nil {
-			log.Printf("Failed to parse base response: %v", err)
-			continue
-		}
-
-		ps.reqMu.RLock()
-		activeResp := ps.pendingReqs[baseResp.ID]
-		ps.reqMu.RUnlock()
-
-		go ps.processResponseChunkWhenReady(activeResp, rawMsg, baseResp.ChunkNum)
+		ps.handleServiceMessage(rawMsg)
 	}
 
 	// Cleanup
@@ -154,67 +151,28 @@ func (ps *ProxyServer) handleServiceRegistration(w http.ResponseWriter, r *http.
 	log.Printf("Service %s disconnected", regMsg.Subdomain)
 }
 
-func (ps *ProxyServer) processResponseChunkWhenReady(resp *PendingResponse, rawMsg json.RawMessage, chunkID int) {
-	// Wait until it's this chunk's turn
-	resp.mu.Lock()
-	for resp.nextChunk != chunkID {
-		resp.chunkCond.Wait() // Sleep until previous chunk notifies
-	}
-	resp.mu.Unlock()
-
-	// Process the chunk
-	log.Printf("Processing response chunk %d for request %s", chunkID, resp.ID)
-	ps.handleServiceMessage(rawMsg)
-	log.Printf("Completed response chunk %d for request %s", chunkID, resp.ID)
-
-	// Mark this chunk as done and notify all waiting goroutines
-	resp.mu.Lock()
-	resp.nextChunk++
-	resp.chunkCond.Broadcast() // Wake up all waiting goroutines
-	resp.mu.Unlock()
-}
-
 func (ps *ProxyServer) handleServiceMessage(rawMsg json.RawMessage) {
-	var msgType struct {
-		Type string `json:"type"`
-		ID   string `json:"id"`
-	}
-
-	if err := json.Unmarshal(rawMsg, &msgType); err != nil {
-		log.Printf("Failed to parse message type: %v", err)
+	// Fast ID extraction - minimal parsing on critical path
+	id := fastExtractID(rawMsg)
+	if id == "" {
+		log.Printf("Failed to extract ID from message")
 		return
 	}
 
-	log.Printf("In handleServiceMessage ID = %s Type %s", msgType.ID, msgType.Type)
+	log.Printf("In handleServiceMessage ID = %s", id)
 
 	ps.reqMu.RLock()
-	activeResp, exists := ps.pendingReqs[msgType.ID]
+	activeResp, exists := ps.pendingReqs[id]
 	ps.reqMu.RUnlock()
 
 	if !exists {
 		return
 	}
 
-	// Send messages through channel instead of direct handling
-	switch msgType.Type {
-	case "raw_http_request_chunk_with_eos":
-		var respChunk protocol.ProxyRawRequestChunkWithEOS
-		if err := json.Unmarshal(rawMsg, &respChunk); err != nil {
-			ps.sendResponseMessage(activeResp, ResponseMessage{Error: err})
-			return
-		}
-		ps.sendResponseMessage(activeResp, ResponseMessage{
-			Type: "raw_http_request_chunk_with_eos",
-			Data: respChunk,
-		})
-	}
-}
-
-func (ps *ProxyServer) sendResponseMessage(activeResp *PendingResponse, msg ResponseMessage) {
+	// Forward raw JSON - parsing happens later when actually needed
 	select {
-	case activeResp.ResponseChan <- msg:
+	case activeResp.ResponseChan <- rawMsg:
 	case <-time.After(1 * time.Second):
-		// Channel is blocked or closed, request might have timed out
 		log.Printf("Failed to send response message, channel blocked")
 	}
 }
@@ -232,14 +190,14 @@ func (ps *ProxyServer) handleHTTPProxy(w http.ResponseWriter, r *http.Request) {
 	// Find service
 	ps.mu.Lock()
 	service, exists := ps.services[subdomain]
-	requestID := service.requestID
-	service.requestID++
-	ps.mu.Unlock()
-
 	if !exists {
+		ps.mu.Unlock()
 		http.Error(w, "Service not found", http.StatusNotFound)
 		return
 	}
+	requestID := service.requestID
+	service.requestID++
+	ps.mu.Unlock()
 
 	// Generate request ID
 	reqID := fmt.Sprintf("%s-%d-%d", subdomain, requestID, time.Now().UnixNano())
@@ -290,12 +248,16 @@ func (ps *ProxyServer) handleHTTPProxy(w http.ResponseWriter, r *http.Request) {
 
 		if writeErr != nil {
 			log.Printf("Failed to send chunk: %v", writeErr)
-			break
+			ps.reqMu.Lock()
+			delete(ps.pendingReqs, reqID)
+			ps.reqMu.Unlock()
+			http.Error(w, "Failed to forward request", http.StatusBadGateway)
+			return
 		}
 		chunkNum++
 	}
 
-	// Set up timeout cleanup
+	// Process response
 	ps.processResponse(w, activeResp.ResponseChan)
 
 	// Cleanup
@@ -304,29 +266,25 @@ func (ps *ProxyServer) handleHTTPProxy(w http.ResponseWriter, r *http.Request) {
 	ps.reqMu.Unlock()
 }
 
-func (ps *ProxyServer) processResponse(w http.ResponseWriter, responseChan chan ResponseMessage) {
+func (ps *ProxyServer) processResponse(w http.ResponseWriter, responseChan chan json.RawMessage) {
 	headersSent := false
 	timeout := time.After(120 * time.Second)
 	responseBuffer := &strings.Builder{}
 
 	for {
 		select {
-		case msg := <-responseChan:
-			if msg.Error != nil {
-				if !headersSent {
-					http.Error(w, "Internal server error", http.StatusInternalServerError)
-				}
-				return
+		case rawMsg := <-responseChan:
+			// Parse only when we actually need to process it
+			var chunk protocol.ProxyRawRequestChunkWithEOS
+			if err := json.Unmarshal(rawMsg, &chunk); err != nil {
+				log.Printf("Failed to parse response chunk: %v", err)
+				continue
 			}
 
-			switch msg.Type {
-			case "raw_http_request_chunk_with_eos":
-				chunk := msg.Data.(protocol.ProxyRawRequestChunkWithEOS)
-				ps.handleRawResponseChunk(w, chunk, responseBuffer, &headersSent)
+			ps.handleRawResponseChunk(w, chunk, responseBuffer, &headersSent)
 
-				if chunk.EOS {
-					return // Complete response
-				}
+			if chunk.EOS {
+				return
 			}
 
 		case <-timeout:
@@ -398,7 +356,7 @@ func main() {
 	keyFile := flag.String("keyFile", "", "Path to the TLS key file")
 	svcCertFile := flag.String("svcCertFile", "", "Path to the TLS certificate file")
 	svcKeyFile := flag.String("svcKeyFile", "", "Path to the TLS key file")
-	authTokenFlag := flag.String("authToken", "", "Path to the TLS key file")
+	authTokenFlag := flag.String("authToken", "", "Authentication token")
 
 	flag.Parse()
 
@@ -431,7 +389,9 @@ func main() {
 			w.Write([]byte("ok"))
 		})
 
-		tlsConfig := &tls.Config{}
+		tlsConfig := &tls.Config{
+			NextProtos: []string{"http/1.1"}, // Force HTTP/1.1
+		}
 
 		srv := &http.Server{
 			Addr:      fmt.Sprintf(":%d", *servicePort),
@@ -447,7 +407,9 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", server.handleHTTPProxy)
 
-	tlsConfig := &tls.Config{}
+	tlsConfig := &tls.Config{
+		NextProtos: []string{"http/1.1"}, // Force HTTP/1.1
+	}
 
 	srv := &http.Server{
 		Addr:      fmt.Sprintf(":%d", *publicPort),
