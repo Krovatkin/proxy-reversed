@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/tls"
 	"encoding/base64"
@@ -21,22 +22,19 @@ import (
 var serverPort string
 
 type ActiveRequest struct {
-	Method        string
-	Path          string
-	Headers       map[string]string
-	Body          *bytes.Buffer
-	ID            string
-	ContentLength int64
-	mu            sync.Mutex
-	nextChunk     int
-	chunkCond     *sync.Cond
+	RawHTTPData *bytes.Buffer
+	ID          string
+	TotalSize   int
+	mu          sync.Mutex
+	nextChunk   int
+	chunkCond   *sync.Cond
 }
 
 func NewActiveRequest(requestID string) *ActiveRequest {
 	req := &ActiveRequest{
-		ID:        requestID,
-		Body:      bytes.NewBuffer(nil),
-		nextChunk: 0,
+		ID:          requestID,
+		RawHTTPData: bytes.NewBuffer(nil),
+		nextChunk:   0,
 	}
 	req.chunkCond = sync.NewCond(&req.mu)
 	return req
@@ -50,7 +48,7 @@ type ServiceClient struct {
 	conn         *websocket.Conn
 	activeReqs   map[string]*ActiveRequest
 	reqMu        sync.RWMutex
-	connMu       sync.Mutex // Add this for WebSocket write synchronization
+	connMu       sync.Mutex
 }
 
 func NewServiceClient(serverDomain, subdomain, authToken, localPort string) *ServiceClient {
@@ -66,12 +64,6 @@ func NewServiceClient(serverDomain, subdomain, authToken, localPort string) *Ser
 func (sc *ServiceClient) writeJSON(v interface{}) error {
 	sc.connMu.Lock()
 	defer sc.connMu.Unlock()
-
-	// prettyJSON, err := json.MarshalIndent(v, "", "  ")
-	// if err == nil {
-	// 	log.Printf("writeJSON: \n%s", string(prettyJSON))
-	// }
-
 	return sc.conn.WriteJSON(v)
 }
 
@@ -121,19 +113,6 @@ func (sc *ServiceClient) connect() error {
 	return nil
 }
 
-// func (sc *ServiceClient) handleRequests() {
-// 	for {
-// 		var rawMsg json.RawMessage
-// 		err := sc.conn.ReadJSON(&rawMsg)
-// 		if err != nil {
-// 			log.Printf("Connection closed: %v", err)
-// 			break
-// 		}
-
-// 		go sc.processMessage(rawMsg)
-// 	}
-// }
-
 func (sc *ServiceClient) handleRequests() {
 	for {
 		var baseReq protocol.ProxyBaseMessage
@@ -147,7 +126,8 @@ func (sc *ServiceClient) handleRequests() {
 
 		err = json.Unmarshal(rawMsg, &baseReq)
 		if err != nil {
-			// Handle the parsing error
+			log.Printf("Failed to parse base message: %v", err)
+			continue
 		}
 
 		sc.reqMu.RLock()
@@ -169,7 +149,7 @@ func (sc *ServiceClient) processChunkWhenReady(req *ActiveRequest, rawMsg json.R
 	// Wait until it's this chunk's turn
 	req.mu.Lock()
 	for req.nextChunk != chunkID {
-		req.chunkCond.Wait() // Sleep until previous chunk notifies
+		req.chunkCond.Wait()
 	}
 	req.mu.Unlock()
 
@@ -181,7 +161,7 @@ func (sc *ServiceClient) processChunkWhenReady(req *ActiveRequest, rawMsg json.R
 	// Mark this chunk as done and notify all waiting goroutines
 	req.mu.Lock()
 	req.nextChunk++
-	req.chunkCond.Broadcast() // Wake up all waiting goroutines
+	req.chunkCond.Broadcast()
 	req.mu.Unlock()
 }
 
@@ -195,51 +175,39 @@ func (sc *ServiceClient) processMessage(rawMsg json.RawMessage) {
 		log.Printf("Failed to parse message: %v", err)
 		return
 	}
+
 	log.Printf("In processMessage ID = %s type = %s", msgType.ID, msgType.Type)
+
 	switch msgType.Type {
-	case "request_start":
-		var reqStart protocol.ProxyRequestStart
+	case "raw_request_start":
+		var reqStart protocol.ProxyRawRequestStart
 		json.Unmarshal(rawMsg, &reqStart)
-		sc.handleRequestStart(reqStart)
+		sc.handleRawRequestStart(reqStart)
 
-	case "request_chunk":
-		var reqChunk protocol.ProxyRequestChunk
+	case "raw_request_chunk":
+		var reqChunk protocol.ProxyRawRequestChunk
 		json.Unmarshal(rawMsg, &reqChunk)
-		sc.handleRequestChunk(reqChunk)
+		sc.handleRawRequestChunk(reqChunk)
 
-	case "request_end":
-		var reqEnd protocol.ProxyRequestEnd
+	case "raw_request_end":
+		var reqEnd protocol.ProxyRawRequestEnd
 		json.Unmarshal(rawMsg, &reqEnd)
-		sc.handleRequestEnd(reqEnd)
+		sc.handleRawRequestEnd(reqEnd)
 	}
 }
 
-func (sc *ServiceClient) handleRequestStart(reqStart protocol.ProxyRequestStart) {
-
+func (sc *ServiceClient) handleRawRequestStart(reqStart protocol.ProxyRawRequestStart) {
 	sc.reqMu.Lock()
 	activeReq := sc.activeReqs[reqStart.ID]
 	sc.reqMu.Unlock()
 
-	activeReq.Method = reqStart.Method
-	activeReq.Path = reqStart.Path
-	activeReq.Headers = reqStart.Headers
-	activeReq.ContentLength = reqStart.ContentLength
-
-	// if !reqStart.HasBody {
-	// 	// No body expected, process immediately
-	// 	sc.executeRequest(activeReq)
-	// }
+	activeReq.TotalSize = reqStart.TotalSize
 }
 
-func (sc *ServiceClient) handleRequestChunk(chunk protocol.ProxyRequestChunk) {
+func (sc *ServiceClient) handleRawRequestChunk(chunk protocol.ProxyRawRequestChunk) {
 	sc.reqMu.RLock()
-	//activeReq, exists := sc.activeReqs[chunk.ID]
 	activeReq := sc.activeReqs[chunk.ID]
 	sc.reqMu.RUnlock()
-
-	// if !exists {
-	// 	return
-	// }
 
 	if chunk.Data != "" {
 		data, err := base64.StdEncoding.DecodeString(chunk.Data)
@@ -247,25 +215,20 @@ func (sc *ServiceClient) handleRequestChunk(chunk protocol.ProxyRequestChunk) {
 			log.Printf("Failed to decode chunk: %v", err)
 			return
 		}
-		log.Printf("In handleRequestChunk ID = %s data = %s", chunk.ID, data)
+
 		activeReq.mu.Lock()
-		activeReq.Body.Write(data)
+		activeReq.RawHTTPData.Write(data)
 		activeReq.mu.Unlock()
 	}
 }
 
-func (sc *ServiceClient) handleRequestEnd(reqEnd protocol.ProxyRequestEnd) {
+func (sc *ServiceClient) handleRawRequestEnd(reqEnd protocol.ProxyRawRequestEnd) {
 	sc.reqMu.RLock()
-	//activeReq, exists := sc.activeReqs[reqEnd.ID]
 	activeReq := sc.activeReqs[reqEnd.ID]
 	sc.reqMu.RUnlock()
 
-	// if !exists {
-	// 	return
-	// }
-
 	// Execute the complete request
-	sc.executeRequest(activeReq)
+	sc.executeRawRequest(activeReq)
 
 	// Cleanup
 	sc.reqMu.Lock()
@@ -273,36 +236,49 @@ func (sc *ServiceClient) handleRequestEnd(reqEnd protocol.ProxyRequestEnd) {
 	sc.reqMu.Unlock()
 }
 
-func (sc *ServiceClient) executeRequest(activeReq *ActiveRequest) {
-	localURL := fmt.Sprintf("http://localhost:%s%s", sc.localPort, activeReq.Path)
-
-	log.Printf("Forwarding Request %s to %s", activeReq.ID, localURL)
-	// Create HTTP request
-	req, err := http.NewRequest(activeReq.Method, localURL, activeReq.Body)
+func (sc *ServiceClient) executeRawRequest(activeReq *ActiveRequest) {
+	// Parse the raw HTTP data
+	req, err := sc.createRequestFromRawHTTP(activeReq.RawHTTPData.String())
 	if err != nil {
-		log.Printf("Failed to create request %s", activeReq.ID)
-		sc.sendErrorResponse(activeReq.ID, 500, "Failed to create request")
+		log.Printf("Failed to create request: %v", err)
+		sc.sendErrorResponse(activeReq.ID, 500, "Failed to parse request")
 		return
 	}
 
-	// Set headers (excluding proxy headers)
-	for k, v := range activeReq.Headers {
-		lowerKey := strings.ToLower(k)
-		if !strings.HasPrefix(lowerKey, "x-forwarded-") &&
-			strings.ToLower(k) != "host" {
+	// Filter out problematic headers
+	headersToRemove := []string{
+		"Upgrade-Insecure-Requests",
+		"Strict-Transport-Security",
+		"X-Forwarded-Ssl",
+		"X-Url-Scheme",
+		"Host", // Will be set automatically by http.Client
+	}
 
-			if lowerKey == "upgrade-insecure-requests" ||
-				lowerKey == "strict-transport-security" ||
-				lowerKey == "x-forwarded-proto" ||
-				lowerKey == "x-forwarded-ssl" ||
-				lowerKey == "x-url-scheme" {
-				continue
+	for _, header := range headersToRemove {
+		req.Header.Del(header)
+	}
+
+	// Remove X-Forwarded-* headers (except the ones we want to keep)
+	for headerName := range req.Header {
+		lowerName := strings.ToLower(headerName)
+		if strings.HasPrefix(lowerName, "x-forwarded-") {
+			// Keep X-Forwarded-For, X-Forwarded-Proto, X-Forwarded-Host
+			if lowerName != "x-forwarded-for" &&
+				lowerName != "x-forwarded-proto" &&
+				lowerName != "x-forwarded-host" {
+				req.Header.Del(headerName)
 			}
-
-			log.Printf("Setting headers %s : %s", k, v)
-			req.Header.Set(k, v)
 		}
 	}
+
+	// Update URL to point to local service
+
+	req.URL.Scheme = "http"
+	req.URL.Host = fmt.Sprintf("localhost:%s", sc.localPort)
+
+	req.RequestURI = ""
+
+	log.Printf("Forwarding Request %s to %s", activeReq.ID, req.URL.String())
 
 	// Execute request
 	client := &http.Client{
@@ -333,7 +309,6 @@ func (sc *ServiceClient) executeRequest(activeReq *ActiveRequest) {
 		StatusCode: resp.StatusCode,
 		Headers:    headers,
 		ChunkNum:   chunkNum,
-		// HasBody:    hasBody,
 	}
 
 	chunkNum++
@@ -350,7 +325,6 @@ func (sc *ServiceClient) executeRequest(activeReq *ActiveRequest) {
 
 		for {
 			n, err := resp.Body.Read(buffer)
-			// log.Printf("activeReq.ID = %s buffer = %s", activeReq.ID, buffer)
 			if n > 0 {
 				chunk := protocol.ProxyResponseChunk{
 					Type:     "response_chunk",
@@ -385,13 +359,25 @@ func (sc *ServiceClient) executeRequest(activeReq *ActiveRequest) {
 	sc.writeJSON(respEnd)
 }
 
+func (sc *ServiceClient) createRequestFromRawHTTP(rawData string) (*http.Request, error) {
+	reader := strings.NewReader(rawData)
+	bufReader := bufio.NewReader(reader)
+
+	// Parse using http.ReadRequest
+	req, err := http.ReadRequest(bufReader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse HTTP request: %v", err)
+	}
+
+	return req, nil
+}
+
 func (sc *ServiceClient) sendErrorResponse(reqID string, statusCode int, message string) {
 	respStart := protocol.ProxyResponseStart{
 		Type:       "response_start",
 		ID:         reqID,
 		StatusCode: statusCode,
 		Headers:    map[string]string{"Content-Type": "text/plain"},
-		// HasBody:    true,
 	}
 	sc.writeJSON(respStart)
 

@@ -63,3 +63,23 @@ type ProxyResponseEnd struct {
 	ID       string `json:"id"`
 	ChunkNum int    `json:"chunk_num"`
 }
+
+type ProxyRawRequestStart struct {
+	Type      string `json:"type"`
+	ID        string `json:"id"`
+	TotalSize int    `json:"total_size"`
+	ChunkNum  int    `json:"chunk_num"`
+}
+
+type ProxyRawRequestChunk struct {
+	Type     string `json:"type"`
+	ID       string `json:"id"`
+	Data     string `json:"data"` // base64 encoded chunk
+	ChunkNum int    `json:"chunk_num"`
+}
+
+type ProxyRawRequestEnd struct {
+	Type     string `json:"type"`
+	ID       string `json:"id"`
+	ChunkNum int    `json:"chunk_num"`
+}

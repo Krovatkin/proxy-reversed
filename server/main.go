@@ -6,9 +6,9 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
+	"net/http/httputil"
 	"os"
 	"strings"
 	"sync"
@@ -139,16 +139,8 @@ func (ps *ProxyServer) handleServiceRegistration(w http.ResponseWriter, r *http.
 		}
 
 		ps.reqMu.RLock()
-		// activeResp, exists := ps.pendingReqs[baseResp.ID]
 		activeResp := ps.pendingReqs[baseResp.ID]
 		ps.reqMu.RUnlock()
-
-		// if !exists {
-		// 	activeResp = NewPendingResponse(baseResp.ID, nil) // w will be nil but we won't use it
-		// 	ps.reqMu.Lock()
-		// 	ps.pendingReqs[baseResp.ID] = activeResp
-		// 	ps.reqMu.Unlock()
-		// }
 
 		go ps.processResponseChunkWhenReady(activeResp, rawMsg, baseResp.ChunkNum)
 	}
@@ -277,37 +269,32 @@ func (ps *ProxyServer) handleHTTPProxy(w http.ResponseWriter, r *http.Request) {
 	ps.pendingReqs[reqID] = activeResp
 	ps.reqMu.Unlock()
 
-	// Prepare headers
-	headers := make(map[string]string)
-	for k, v := range r.Header {
-		if len(v) > 0 {
-			headers[k] = v[0]
-		}
-	}
-	headers["X-Forwarded-For"] = r.RemoteAddr
-	headers["X-Forwarded-Proto"] = "https"
-	headers["X-Forwarded-Host"] = r.Host
-
-	Query := ""
-	if r.URL.RawQuery != "" {
-		Query = "?" + r.URL.RawQuery
+	// Now dump the cleaned request
+	requestDump, err := httputil.DumpRequest(r, true)
+	if err != nil {
+		ps.reqMu.Lock()
+		delete(ps.pendingReqs, reqID)
+		ps.reqMu.Unlock()
+		http.Error(w, "Failed to dump request", http.StatusInternalServerError)
+		return
 	}
 
+	// Send raw request in chunks
 	chunkNum := 0
-	// Send request start
-	reqStart := protocol.ProxyRequestStart{
-		Type:          "request_start",
-		Method:        r.Method,
-		Path:          r.URL.Path + Query,
-		Headers:       headers,
-		ID:            reqID,
-		ContentLength: r.ContentLength,
-		ChunkNum:      chunkNum,
+	requestData := requestDump
+	totalSize := len(requestData)
+
+	// Send request start with total size
+	reqStart := protocol.ProxyRawRequestStart{
+		Type:      "raw_request_start",
+		ID:        reqID,
+		TotalSize: totalSize,
+		ChunkNum:  chunkNum,
 	}
 	chunkNum++
 
 	service.mu.Lock()
-	err := service.conn.WriteJSON(reqStart)
+	err = service.conn.WriteJSON(reqStart)
 	service.mu.Unlock()
 
 	if err != nil {
@@ -318,44 +305,34 @@ func (ps *ProxyServer) handleHTTPProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Stream request body in chunks if present
-	if r.ContentLength > 0 {
-		buffer := make([]byte, protocol.ChunkSize)
-
-		for {
-			n, err := r.Body.Read(buffer)
-			if n > 0 {
-				chunk := protocol.ProxyRequestChunk{
-					Type:     "request_chunk",
-					ID:       reqID,
-					Data:     base64.StdEncoding.EncodeToString(buffer[:n]),
-					ChunkNum: chunkNum,
-				}
-
-				service.mu.Lock()
-				writeErr := service.conn.WriteJSON(chunk)
-				service.mu.Unlock()
-
-				if writeErr != nil {
-					log.Printf("Failed to send chunk: %v", writeErr)
-					break
-				}
-				chunkNum++
-			}
-
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				log.Printf("Error reading request body: %v", err)
-				break
-			}
+	// Send data in chunks
+	for offset := 0; offset < totalSize; offset += protocol.ChunkSize {
+		end := offset + protocol.ChunkSize
+		if end > totalSize {
+			end = totalSize
 		}
+
+		chunk := protocol.ProxyRawRequestChunk{
+			Type:     "raw_request_chunk",
+			ID:       reqID,
+			Data:     base64.StdEncoding.EncodeToString(requestData[offset:end]),
+			ChunkNum: chunkNum,
+		}
+
+		service.mu.Lock()
+		writeErr := service.conn.WriteJSON(chunk)
+		service.mu.Unlock()
+
+		if writeErr != nil {
+			log.Printf("Failed to send chunk: %v", writeErr)
+			break
+		}
+		chunkNum++
 	}
 
 	// Send request end
-	reqEnd := protocol.ProxyRequestEnd{
-		Type:     "request_end",
+	reqEnd := protocol.ProxyRawRequestEnd{
+		Type:     "raw_request_end",
 		ID:       reqID,
 		ChunkNum: chunkNum,
 	}
