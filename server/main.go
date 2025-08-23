@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
@@ -195,34 +197,15 @@ func (ps *ProxyServer) handleServiceMessage(rawMsg json.RawMessage) {
 
 	// Send messages through channel instead of direct handling
 	switch msgType.Type {
-	case "response_start":
-		var respStart protocol.ProxyResponseStart
-		if err := json.Unmarshal(rawMsg, &respStart); err != nil {
-			ps.sendResponseMessage(activeResp, ResponseMessage{Error: err})
-			return
-		}
-		ps.sendResponseMessage(activeResp, ResponseMessage{
-			Type: "response_start",
-			Data: respStart,
-		})
-
-	case "response_chunk":
-		var respChunk protocol.ProxyResponseChunk
+	case "raw_http_request_chunk_with_eos":
+		var respChunk protocol.ProxyRawRequestChunkWithEOS
 		if err := json.Unmarshal(rawMsg, &respChunk); err != nil {
 			ps.sendResponseMessage(activeResp, ResponseMessage{Error: err})
 			return
 		}
 		ps.sendResponseMessage(activeResp, ResponseMessage{
-			Type: "response_chunk",
+			Type: "raw_http_request_chunk_with_eos",
 			Data: respChunk,
-		})
-
-	case "response_end":
-		var respEnd protocol.ProxyResponseEnd
-		json.Unmarshal(rawMsg, &respEnd)
-		ps.sendResponseMessage(activeResp, ResponseMessage{
-			Type: "response_end",
-			Data: respEnd,
 		})
 	}
 }
@@ -284,27 +267,6 @@ func (ps *ProxyServer) handleHTTPProxy(w http.ResponseWriter, r *http.Request) {
 	requestData := requestDump
 	totalSize := len(requestData)
 
-	// // Send request start with total size
-	// reqStart := protocol.ProxyRawRequestStart{
-	// 	Type:      "raw_http_request_start",
-	// 	ID:        reqID,
-	// 	TotalSize: totalSize,
-	// 	ChunkNum:  chunkNum,
-	// }
-	// chunkNum++
-
-	// service.mu.Lock()
-	// err = service.conn.WriteJSON(reqStart)
-	// service.mu.Unlock()
-
-	if err != nil {
-		ps.reqMu.Lock()
-		delete(ps.pendingReqs, reqID)
-		ps.reqMu.Unlock()
-		http.Error(w, "Failed to forward request", http.StatusBadGateway)
-		return
-	}
-
 	// Send data in chunks
 	for offset := 0; offset < totalSize; offset += protocol.ChunkSize {
 		end := offset + protocol.ChunkSize
@@ -333,17 +295,6 @@ func (ps *ProxyServer) handleHTTPProxy(w http.ResponseWriter, r *http.Request) {
 		chunkNum++
 	}
 
-	// Send request end
-	// reqEnd := protocol.ProxyRawRequestEnd{
-	// 	Type:     "raw_http_request_end",
-	// 	ID:       reqID,
-	// 	ChunkNum: chunkNum,
-	// }
-
-	// service.mu.Lock()
-	// service.conn.WriteJSON(reqEnd)
-	// service.mu.Unlock()
-
 	// Set up timeout cleanup
 	ps.processResponse(w, activeResp.ResponseChan)
 
@@ -356,6 +307,7 @@ func (ps *ProxyServer) handleHTTPProxy(w http.ResponseWriter, r *http.Request) {
 func (ps *ProxyServer) processResponse(w http.ResponseWriter, responseChan chan ResponseMessage) {
 	headersSent := false
 	timeout := time.After(120 * time.Second)
+	responseBuffer := &strings.Builder{}
 
 	for {
 		select {
@@ -368,21 +320,13 @@ func (ps *ProxyServer) processResponse(w http.ResponseWriter, responseChan chan 
 			}
 
 			switch msg.Type {
-			case "response_start":
-				if !headersSent {
-					resp := msg.Data.(protocol.ProxyResponseStart)
-					ps.handleResponseStartSync(w, resp)
-					headersSent = true
-				}
+			case "raw_http_request_chunk_with_eos":
+				chunk := msg.Data.(protocol.ProxyRawRequestChunkWithEOS)
+				ps.handleRawResponseChunk(w, chunk, responseBuffer, &headersSent)
 
-			case "response_chunk":
-				if headersSent {
-					chunk := msg.Data.(protocol.ProxyResponseChunk)
-					ps.handleResponseChunkSync(w, chunk)
+				if chunk.EOS {
+					return // Complete response
 				}
-
-			case "response_end":
-				return // Complete response
 			}
 
 		case <-timeout:
@@ -394,14 +338,7 @@ func (ps *ProxyServer) processResponse(w http.ResponseWriter, responseChan chan 
 	}
 }
 
-func (ps *ProxyServer) handleResponseStartSync(w http.ResponseWriter, resp protocol.ProxyResponseStart) {
-	for k, v := range resp.Headers {
-		w.Header().Set(k, v)
-	}
-	w.WriteHeader(resp.StatusCode)
-}
-
-func (ps *ProxyServer) handleResponseChunkSync(w http.ResponseWriter, chunk protocol.ProxyResponseChunk) {
+func (ps *ProxyServer) handleRawResponseChunk(w http.ResponseWriter, chunk protocol.ProxyRawRequestChunkWithEOS, responseBuffer *strings.Builder, headersSent *bool) {
 	if chunk.Data == "" {
 		return
 	}
@@ -412,9 +349,43 @@ func (ps *ProxyServer) handleResponseChunkSync(w http.ResponseWriter, chunk prot
 		return
 	}
 
-	w.Write(data)
-	if flusher, ok := w.(http.Flusher); ok {
-		flusher.Flush()
+	responseBuffer.Write(data)
+
+	if chunk.EOS {
+		// Parse the complete HTTP response
+		rawResponse := responseBuffer.String()
+		reader := strings.NewReader(rawResponse)
+		bufReader := bufio.NewReader(reader)
+		resp, err := http.ReadResponse(bufReader, nil)
+		if err != nil {
+			log.Printf("Failed to parse HTTP response: %v", err)
+			if !*headersSent {
+				http.Error(w, "Failed to parse response", http.StatusBadGateway)
+			}
+			return
+		}
+		defer resp.Body.Close()
+
+		// Copy headers
+		for k, v := range resp.Header {
+			for _, val := range v {
+				w.Header().Add(k, val)
+			}
+		}
+
+		// Write status code
+		w.WriteHeader(resp.StatusCode)
+		*headersSent = true
+
+		// Copy body using io.Copy
+		_, err = io.Copy(w, resp.Body)
+		if err != nil {
+			log.Printf("Failed to write response body: %v", err)
+		}
+
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
 	}
 }
 

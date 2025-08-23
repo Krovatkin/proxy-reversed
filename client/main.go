@@ -8,9 +8,9 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
+	"net/http/httputil"
 	"strings"
 	"sync"
 	"time"
@@ -178,47 +178,12 @@ func (sc *ServiceClient) processMessage(rawMsg json.RawMessage) {
 	log.Printf("In processMessage ID = %s type = %s", msgType.ID, msgType.Type)
 
 	switch msgType.Type {
-	// case "raw_http_request_start":
-	// 	var reqStart protocol.ProxyRawRequestStart
-	// 	json.Unmarshal(rawMsg, &reqStart)
-	// 	sc.handleRawRequestStart(reqStart)
-
-	// case "raw_http_request_chunk":
-	// 	var reqChunk protocol.ProxyRawRequestChunk
-	// 	json.Unmarshal(rawMsg, &reqChunk)
-	// 	sc.handleRawRequestChunk(reqChunk)
 	case "raw_http_request_chunk_with_eos":
 		var reqChunk protocol.ProxyRawRequestChunkWithEOS
 		json.Unmarshal(rawMsg, &reqChunk)
 		sc.handleRawRequestChunkWithEOS(reqChunk)
-
-		// case "raw_http_request_end":
-		// 	var reqEnd protocol.ProxyRawRequestEnd
-		// 	json.Unmarshal(rawMsg, &reqEnd)
-		// 	sc.handleRawRequestEnd(reqEnd)
 	}
 }
-
-// func (sc *ServiceClient) handleRawRequestStart(reqStart protocol.ProxyRawRequestStart) {
-// }
-
-// func (sc *ServiceClient) handleRawRequestChunk(chunk protocol.ProxyRawRequestChunk) {
-// 	sc.reqMu.RLock()
-// 	activeReq := sc.activeReqs[chunk.ID]
-// 	sc.reqMu.RUnlock()
-
-// 	if chunk.Data != "" {
-// 		data, err := base64.StdEncoding.DecodeString(chunk.Data)
-// 		if err != nil {
-// 			log.Printf("Failed to decode chunk: %v", err)
-// 			return
-// 		}
-
-// 		activeReq.mu.Lock()
-// 		activeReq.RawHTTPData.Write(data)
-// 		activeReq.mu.Unlock()
-// 	}
-// }
 
 func (sc *ServiceClient) handleRawRequestChunkWithEOS(chunk protocol.ProxyRawRequestChunkWithEOS) {
 	sc.reqMu.RLock()
@@ -238,7 +203,6 @@ func (sc *ServiceClient) handleRawRequestChunkWithEOS(chunk protocol.ProxyRawReq
 	}
 
 	if chunk.EOS {
-
 		sc.reqMu.RLock()
 		activeReq = sc.activeReqs[chunk.ID]
 		sc.reqMu.RUnlock()
@@ -248,22 +212,7 @@ func (sc *ServiceClient) handleRawRequestChunkWithEOS(chunk protocol.ProxyRawReq
 		sc.reqMu.Lock()
 		delete(sc.activeReqs, chunk.ID)
 		sc.reqMu.Unlock()
-
 	}
-}
-
-func (sc *ServiceClient) handleRawRequestEnd(reqEnd protocol.ProxyRawRequestEnd) {
-	sc.reqMu.RLock()
-	activeReq := sc.activeReqs[reqEnd.ID]
-	sc.reqMu.RUnlock()
-
-	// Execute the complete request
-	sc.executeRawRequest(activeReq)
-
-	// Cleanup
-	sc.reqMu.Lock()
-	delete(sc.activeReqs, reqEnd.ID)
-	sc.reqMu.Unlock()
 }
 
 func (sc *ServiceClient) executeRawRequest(activeReq *ActiveRequest) {
@@ -302,10 +251,8 @@ func (sc *ServiceClient) executeRawRequest(activeReq *ActiveRequest) {
 	}
 
 	// Update URL to point to local service
-
 	req.URL.Scheme = "http"
 	req.URL.Host = fmt.Sprintf("localhost:%s", sc.localPort)
-
 	req.RequestURI = ""
 
 	log.Printf("Forwarding Request %s to %s", activeReq.ID, req.URL.String())
@@ -322,71 +269,43 @@ func (sc *ServiceClient) executeRawRequest(activeReq *ActiveRequest) {
 	}
 	defer resp.Body.Close()
 
-	// Send response start
-	headers := make(map[string]string)
-	for k, v := range resp.Header {
-		if len(v) > 0 {
-			headers[k] = v[0]
-		}
-	}
-
-	hasBody := resp.ContentLength != 0 && resp.StatusCode != http.StatusNoContent
-
-	chunkNum := 0
-	respStart := protocol.ProxyResponseStart{
-		Type:       "response_start",
-		ID:         activeReq.ID,
-		StatusCode: resp.StatusCode,
-		Headers:    headers,
-		ChunkNum:   chunkNum,
-	}
-
-	chunkNum++
-
-	err = sc.writeJSON(respStart)
+	// Dump the entire response as raw HTTP
+	responseDump, err := httputil.DumpResponse(resp, true)
 	if err != nil {
-		log.Printf("Failed to send response start: %v", err)
+		log.Printf("Failed to dump response: %v", err)
+		sc.sendErrorResponse(activeReq.ID, 500, "Failed to dump response")
 		return
 	}
 
-	// Stream response body in chunks if there is one
-	if hasBody {
-		buffer := make([]byte, protocol.ChunkSize)
+	// Send raw response in chunks using the same chunk type
+	chunkNum := 0
+	responseData := responseDump
+	totalSize := len(responseData)
 
-		for {
-			n, err := resp.Body.Read(buffer)
-			if n > 0 {
-				chunk := protocol.ProxyResponseChunk{
-					Type:     "response_chunk",
-					ID:       activeReq.ID,
-					Data:     base64.StdEncoding.EncodeToString(buffer[:n]),
-					ChunkNum: chunkNum,
-				}
-				writeErr := sc.writeJSON(chunk)
-				if writeErr != nil {
-					log.Printf("Failed to send response chunk: %v", writeErr)
-					return
-				}
-				chunkNum++
-			}
-
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				log.Printf("Error reading response: %v", err)
-				break
-			}
+	// Send data in chunks
+	for offset := 0; offset < totalSize; offset += protocol.ChunkSize {
+		end := offset + protocol.ChunkSize
+		EOS := false
+		if end >= totalSize {
+			EOS = true
+			end = totalSize
 		}
-	}
 
-	// Send response end
-	respEnd := protocol.ProxyResponseEnd{
-		Type:     "response_end",
-		ID:       activeReq.ID,
-		ChunkNum: chunkNum,
+		chunk := protocol.ProxyRawRequestChunkWithEOS{
+			Type:     "raw_http_request_chunk_with_eos",
+			ID:       activeReq.ID,
+			Data:     base64.StdEncoding.EncodeToString(responseData[offset:end]),
+			EOS:      EOS,
+			ChunkNum: chunkNum,
+		}
+
+		writeErr := sc.writeJSON(chunk)
+		if writeErr != nil {
+			log.Printf("Failed to send response chunk: %v", writeErr)
+			return
+		}
+		chunkNum++
 	}
-	sc.writeJSON(respEnd)
 }
 
 func (sc *ServiceClient) createRequestFromRawHTTP(rawData string) (*http.Request, error) {
@@ -403,26 +322,34 @@ func (sc *ServiceClient) createRequestFromRawHTTP(rawData string) (*http.Request
 }
 
 func (sc *ServiceClient) sendErrorResponse(reqID string, statusCode int, message string) {
-	respStart := protocol.ProxyResponseStart{
-		Type:       "response_start",
-		ID:         reqID,
-		StatusCode: statusCode,
-		Headers:    map[string]string{"Content-Type": "text/plain"},
-	}
-	sc.writeJSON(respStart)
+	// Create a simple HTTP response
+	errorResponse := fmt.Sprintf("HTTP/1.1 %d %s\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s",
+		statusCode, http.StatusText(statusCode), len(message), message)
 
-	chunk := protocol.ProxyResponseChunk{
-		Type: "response_chunk",
-		ID:   reqID,
-		Data: base64.StdEncoding.EncodeToString([]byte(message)),
-	}
-	sc.writeJSON(chunk)
+	// Send as raw HTTP response chunks
+	chunkNum := 0
+	responseData := []byte(errorResponse)
+	totalSize := len(responseData)
 
-	respEnd := protocol.ProxyResponseEnd{
-		Type: "response_end",
-		ID:   reqID,
+	for offset := 0; offset < totalSize; offset += protocol.ChunkSize {
+		end := offset + protocol.ChunkSize
+		EOS := false
+		if end >= totalSize {
+			EOS = true
+			end = totalSize
+		}
+
+		chunk := protocol.ProxyRawRequestChunkWithEOS{
+			Type:     "raw_http_request_chunk_with_eos",
+			ID:       reqID,
+			Data:     base64.StdEncoding.EncodeToString(responseData[offset:end]),
+			EOS:      EOS,
+			ChunkNum: chunkNum,
+		}
+
+		sc.writeJSON(chunk)
+		chunkNum++
 	}
-	sc.writeJSON(respEnd)
 }
 
 func (sc *ServiceClient) run() error {
