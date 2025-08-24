@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httputil"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -19,7 +20,12 @@ import (
 	"github.com/krovatkin/proxy-reversed/protocol"
 )
 
-var serverPort string
+var (
+	version    = "dev"
+	buildDate  = "unknown"
+	gitCommit  = "unknown"
+	serverPort string
+)
 
 type ActiveRequest struct {
 	RawHTTPData *bytes.Buffer
@@ -366,15 +372,29 @@ func (sc *ServiceClient) run() error {
 	return nil
 }
 
+// Add these version variables at the top of the file, after the imports
+
+// Then replace the existing main() function with this:
 func main() {
+	// Print version information
+	log.Printf("Pontivex Client %s (built %s, commit %s)", version, buildDate, gitCommit)
+
 	var (
 		serverDomain   = flag.String("server", "", "Server domain name")
 		subdomain      = flag.String("subdomain", "", "App subdomain to serve requests")
 		authToken      = flag.String("token", "", "Authentication token")
 		localPort      = flag.String("port", "", "Local port to forward requests to")
 		serverPortFlag = flag.String("server-port", "7000", "Server port number")
+		showVersion    = flag.Bool("version", false, "Show version information")
 	)
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("Pontivex Client %s\n", version)
+		fmt.Printf("Build Date: %s\n", buildDate)
+		fmt.Printf("Git Commit: %s\n", gitCommit)
+		os.Exit(0)
+	}
 
 	serverPort = *serverPortFlag
 

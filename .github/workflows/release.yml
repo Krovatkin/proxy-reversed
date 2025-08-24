@@ -1,0 +1,175 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'  # Triggers on version tags like v1.0.0, v2.1.3, etc.
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  build:
+    name: Build and Release
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        goos: [linux, windows, darwin]
+        goarch: [amd64, arm64]
+        exclude:
+          - goos: windows
+            goarch: arm64
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Fetch full history for git commit info
+    
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.24.5'
+    
+    - name: Get dependencies
+      run: go mod download
+    
+    - name: Get build info
+      id: build_info
+      run: |
+        echo "BUILD_DATE=$(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_OUTPUT
+        echo "GIT_COMMIT=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+        echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+    
+    - name: Build binaries
+      env:
+        GOOS: ${{ matrix.goos }}
+        GOARCH: ${{ matrix.goarch }}
+      run: |
+        # Determine binary extensions
+        SERVER_BINARY="pontifex"
+        CLIENT_BINARY="pontivex"
+        if [ "$GOOS" = "windows" ]; then
+          SERVER_BINARY="${SERVER_BINARY}.exe"
+          CLIENT_BINARY="${CLIENT_BINARY}.exe"
+        fi
+        
+        # Build server binary
+        cd server
+        go build -v \
+          -ldflags="-s -w -X 'main.version=${{ steps.build_info.outputs.VERSION }}' -X 'main.buildDate=${{ steps.build_info.outputs.BUILD_DATE }}' -X 'main.gitCommit=${{ steps.build_info.outputs.GIT_COMMIT }}'" \
+          -o ../${SERVER_BINARY} .
+        cd ..
+        
+        # Build client binary  
+        cd client
+        go build -v \
+          -ldflags="-s -w -X 'main.version=${{ steps.build_info.outputs.VERSION }}' -X 'main.buildDate=${{ steps.build_info.outputs.BUILD_DATE }}' -X 'main.gitCommit=${{ steps.build_info.outputs.GIT_COMMIT }}'" \
+          -o ../${CLIENT_BINARY} .
+        cd ..
+        
+        # Create release directory structure
+        RELEASE_DIR="pontifex-${{ steps.build_info.outputs.VERSION }}-${GOOS}-${GOARCH}"
+        mkdir -p ${RELEASE_DIR}
+        
+        # Copy binaries
+        cp ${SERVER_BINARY} ${RELEASE_DIR}/
+        cp ${CLIENT_BINARY} ${RELEASE_DIR}/
+        
+        # Create archive
+        if [ "$GOOS" = "windows" ]; then
+          ARCHIVE_NAME="${RELEASE_DIR}.zip"
+          zip -r ${ARCHIVE_NAME} ${RELEASE_DIR}
+        else
+          ARCHIVE_NAME="${RELEASE_DIR}.tar.gz"
+          tar -czf ${ARCHIVE_NAME} ${RELEASE_DIR}
+        fi
+        
+        echo "ARCHIVE_NAME=${ARCHIVE_NAME}" >> $GITHUB_ENV
+        echo "SERVER_BINARY=${SERVER_BINARY}" >> $GITHUB_ENV
+        echo "CLIENT_BINARY=${CLIENT_BINARY}" >> $GITHUB_ENV
+        echo "RELEASE_DIR=${RELEASE_DIR}" >> $GITHUB_ENV
+    
+    - name: Upload Release Asset
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.ARCHIVE_NAME }}
+        path: ${{ env.ARCHIVE_NAME }}
+        retention-days: 1
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Get build info
+      id: build_info
+      run: |
+        echo "BUILD_DATE=$(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_OUTPUT
+        echo "GIT_COMMIT=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+        echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+    
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: ./artifacts
+        merge-multiple: true
+    
+    - name: List artifacts (debug)
+      run: |
+        echo "Artifacts downloaded:"
+        ls -la ./artifacts/
+    
+    - name: Create Release
+      id: create_release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ github.ref_name }}
+        name: Release ${{ github.ref_name }}
+        draft: false
+        prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
+        files: ./artifacts/*
+        body: |
+          ## Changes in this Release
+          - Auto-generated release for ${{ github.ref_name }}
+          
+          ## Downloads
+          Choose the appropriate archive for your operating system and extract it:
+          - **Linux**: `pontifex-${{ steps.build_info.outputs.VERSION }}-linux-amd64.tar.gz` or `pontifex-${{ steps.build_info.outputs.VERSION }}-linux-arm64.tar.gz`
+          - **macOS**: `pontifex-${{ steps.build_info.outputs.VERSION }}-darwin-amd64.tar.gz` or `pontifex-${{ steps.build_info.outputs.VERSION }}-darwin-arm64.tar.gz` 
+          - **Windows**: `pontifex-${{ steps.build_info.outputs.VERSION }}-windows-amd64.zip`
+          
+          Each archive contains:
+          - `pontifex` binary (or `pontifex.exe` on Windows) - The server component
+          - `pontivex` binary (or `pontivex.exe` on Windows) - The client component
+          
+          ## Installation
+          1. Download the appropriate archive for your system
+          2. Extract the archive to your desired location
+          3. Run the binaries from the extracted directory
+          
+          ## Usage
+          **Server (pontifex):**
+          ```bash
+          ./pontifex --authToken=your-token --certFile=cert.pem --keyFile=key.pem --svcCertFile=svc-cert.pem --svcKeyFile=svc-key.pem
+          ```
+          
+          **Client (pontivex):**
+          ```bash
+          ./pontivex --server=your-domain.com --subdomain=myapp --token=your-token --port=3000
+          ```
+          
+          ## Version Information
+          - Version: ${{ steps.build_info.outputs.VERSION }}
+          - Build Date: ${{ steps.build_info.outputs.BUILD_DATE }}
+          - Git Commit: ${{ steps.build_info.outputs.GIT_COMMIT }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+

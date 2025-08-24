@@ -21,7 +21,12 @@ import (
 	"github.com/krovatkin/proxy-reversed/protocol"
 )
 
-var authToken string
+var (
+	version   = "dev"
+	buildDate = "unknown"
+	gitCommit = "unknown"
+	authToken string
+)
 
 type ServiceConnection struct {
 	conn      *websocket.Conn
@@ -350,6 +355,10 @@ func (ps *ProxyServer) handleRawResponseChunk(w http.ResponseWriter, chunk proto
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Llongfile)
+
+	// Print version information
+	log.Printf("Pontifex Server %s (built %s, commit %s)", version, buildDate, gitCommit)
+
 	server := NewProxyServer()
 	servicePort := flag.Int("servicePort", 7000, "Port for the service registration server")
 	publicPort := flag.Int("publicPort", 8443, "Port for the public-facing HTTP proxy server")
@@ -358,8 +367,16 @@ func main() {
 	svcCertFile := flag.String("svcCertFile", "", "Path to the TLS certificate file")
 	svcKeyFile := flag.String("svcKeyFile", "", "Path to the TLS key file")
 	authTokenFlag := flag.String("authToken", "", "Authentication token")
+	showVersion := flag.Bool("version", false, "Show version information")
 
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("Pontifex Server %s\n", version)
+		fmt.Printf("Build Date: %s\n", buildDate)
+		fmt.Printf("Git Commit: %s\n", gitCommit)
+		os.Exit(0)
+	}
 
 	authToken = *authTokenFlag
 
