@@ -19,6 +19,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/krovatkin/proxy-reversed/protocol"
+	"gopkg.in/yaml.v3"
 )
 
 var (
@@ -27,6 +28,89 @@ var (
 	gitCommit = "unknown"
 	authToken string
 )
+
+// Config represents the YAML configuration structure
+type Config struct {
+	ServicePort int    `yaml:"servicePort"`
+	PublicPort  int    `yaml:"publicPort"`
+	CertFile    string `yaml:"certFile"`
+	KeyFile     string `yaml:"keyFile"`
+	SvcCertFile string `yaml:"svcCertFile"`
+	SvcKeyFile  string `yaml:"svcKeyFile"`
+	AuthToken   string `yaml:"authToken"`
+}
+
+// LoadConfig loads configuration from a YAML file and merges with flags
+func LoadConfig(filename string, flags *Config) (*Config, error) {
+	config := &Config{}
+
+	// Load from file if provided
+	if filename != "" {
+		data, err := os.ReadFile(filename)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read config file: %w", err)
+		}
+
+		if err := yaml.Unmarshal(data, config); err != nil {
+			return nil, fmt.Errorf("failed to parse config file: %w", err)
+		}
+	}
+
+	// Override with command line flags (flags take precedence)
+	if flags.ServicePort != 7000 { // not default value
+		config.ServicePort = flags.ServicePort
+	} else if config.ServicePort == 0 { // no value from file
+		config.ServicePort = 7000
+	}
+
+	if flags.PublicPort != 8443 { // not default value
+		config.PublicPort = flags.PublicPort
+	} else if config.PublicPort == 0 { // no value from file
+		config.PublicPort = 8443
+	}
+
+	if flags.CertFile != "" {
+		config.CertFile = flags.CertFile
+	}
+
+	if flags.KeyFile != "" {
+		config.KeyFile = flags.KeyFile
+	}
+
+	if flags.SvcCertFile != "" {
+		config.SvcCertFile = flags.SvcCertFile
+	}
+
+	if flags.SvcKeyFile != "" {
+		config.SvcKeyFile = flags.SvcKeyFile
+	}
+
+	if flags.AuthToken != "" {
+		config.AuthToken = flags.AuthToken
+	}
+
+	return config, nil
+}
+
+// Validate checks if required configuration values are present
+func (c *Config) Validate() error {
+	if c.AuthToken == "" {
+		return fmt.Errorf("authToken is required")
+	}
+	if c.CertFile == "" {
+		return fmt.Errorf("certFile is required")
+	}
+	if c.KeyFile == "" {
+		return fmt.Errorf("keyFile is required")
+	}
+	if c.SvcCertFile == "" {
+		return fmt.Errorf("svcCertFile is required")
+	}
+	if c.SvcKeyFile == "" {
+		return fmt.Errorf("svcKeyFile is required")
+	}
+	return nil
+}
 
 type ServiceConnection struct {
 	conn      *websocket.Conn
@@ -360,12 +444,15 @@ func main() {
 	log.Printf("Pontifex Server %s (built %s, commit %s)", version, buildDate, gitCommit)
 
 	server := NewProxyServer()
+
+	// Define command line flags with same names as config struct
+	configFile := flag.String("config", "", "Path to YAML configuration file")
 	servicePort := flag.Int("servicePort", 7000, "Port for the service registration server")
 	publicPort := flag.Int("publicPort", 8443, "Port for the public-facing HTTP proxy server")
 	certFile := flag.String("certFile", "", "Path to the TLS certificate file")
 	keyFile := flag.String("keyFile", "", "Path to the TLS key file")
-	svcCertFile := flag.String("svcCertFile", "", "Path to the TLS certificate file")
-	svcKeyFile := flag.String("svcKeyFile", "", "Path to the TLS key file")
+	svcCertFile := flag.String("svcCertFile", "", "Path to the TLS certificate file for service registration")
+	svcKeyFile := flag.String("svcKeyFile", "", "Path to the TLS key file for service registration")
 	authTokenFlag := flag.String("authToken", "", "Authentication token")
 	showVersion := flag.Bool("version", false, "Show version information")
 
@@ -378,27 +465,34 @@ func main() {
 		os.Exit(0)
 	}
 
-	authToken = *authTokenFlag
+	// Create flags config struct
+	flagsConfig := &Config{
+		ServicePort: *servicePort,
+		PublicPort:  *publicPort,
+		CertFile:    *certFile,
+		KeyFile:     *keyFile,
+		SvcCertFile: *svcCertFile,
+		SvcKeyFile:  *svcKeyFile,
+		AuthToken:   *authTokenFlag,
+	}
 
-	if authToken == "" {
-		fmt.Println("Error: --authToken flag is required.")
+	// Load and merge configuration
+	config, err := LoadConfig(*configFile, flagsConfig)
+	if err != nil {
+		log.Fatalf("Failed to load config: %v", err)
+	}
+
+	// Validate configuration
+	if err := config.Validate(); err != nil {
+		fmt.Printf("Configuration error: %v\n", err)
 		flag.Usage()
 		os.Exit(1)
 	}
 
-	if *certFile == "" || *keyFile == "" {
-		fmt.Println("Error: --certFile and --keyFile flags are required.")
-		flag.Usage()
-		os.Exit(1)
-	}
+	// Set global auth token
+	authToken = config.AuthToken
 
-	if *svcCertFile == "" || *svcKeyFile == "" {
-		fmt.Println("Error: --svcCertFile flag is required.")
-		flag.Usage()
-		os.Exit(1)
-	}
-
-	// Service registration server (port 7000)
+	// Service registration server
 	go func() {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/register", server.handleServiceRegistration)
@@ -412,16 +506,16 @@ func main() {
 		}
 
 		srv := &http.Server{
-			Addr:      fmt.Sprintf(":%d", *servicePort),
+			Addr:      fmt.Sprintf(":%d", config.ServicePort),
 			Handler:   mux,
 			TLSConfig: tlsConfig,
 		}
 
-		log.Printf("Service registration server starting on :%d\n", *servicePort)
-		log.Fatal(srv.ListenAndServeTLS(*svcCertFile, *svcKeyFile))
+		log.Printf("Service registration server starting on :%d\n", config.ServicePort)
+		log.Fatal(srv.ListenAndServeTLS(config.SvcCertFile, config.SvcKeyFile))
 	}()
 
-	// HTTP proxy server (port 8443)
+	// HTTP proxy server
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", server.handleHTTPProxy)
 
@@ -430,11 +524,11 @@ func main() {
 	}
 
 	srv := &http.Server{
-		Addr:      fmt.Sprintf(":%d", *publicPort),
+		Addr:      fmt.Sprintf(":%d", config.PublicPort),
 		Handler:   mux,
 		TLSConfig: tlsConfig,
 	}
 
-	log.Printf("HTTP proxy server starting on :%d", *publicPort)
-	log.Fatal(srv.ListenAndServeTLS(*certFile, *keyFile))
+	log.Printf("HTTP proxy server starting on :%d", config.PublicPort)
+	log.Fatal(srv.ListenAndServeTLS(config.CertFile, config.KeyFile))
 }
