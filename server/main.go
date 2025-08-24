@@ -159,13 +159,14 @@ func (ps *ProxyServer) handleServiceMessage(rawMsg json.RawMessage) {
 		return
 	}
 
-	log.Printf("In handleServiceMessage ID = %s", id)
+	log.Printf("Received rawMsg w/ ID %s", id)
 
 	ps.reqMu.RLock()
 	activeResp, exists := ps.pendingReqs[id]
 	ps.reqMu.RUnlock()
 
 	if !exists {
+		log.Printf("ID %s doesn't exist", id)
 		return
 	}
 
@@ -201,7 +202,7 @@ func (ps *ProxyServer) handleHTTPProxy(w http.ResponseWriter, r *http.Request) {
 
 	// Generate request ID
 	reqID := fmt.Sprintf("%s-%d-%d", subdomain, requestID, time.Now().UnixNano())
-	log.Printf("In handleHTTPProxy reqID = %s", reqID)
+	log.Printf("Assigned reqID %s to a new http(s) request", reqID)
 
 	// Register pending request with PendingResponse
 	activeResp := NewPendingResponse(reqID, w)
@@ -348,7 +349,7 @@ func (ps *ProxyServer) handleRawResponseChunk(w http.ResponseWriter, chunk proto
 }
 
 func main() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	log.SetFlags(log.LstdFlags | log.Llongfile)
 	server := NewProxyServer()
 	servicePort := flag.Int("servicePort", 7000, "Port for the service registration server")
 	publicPort := flag.Int("publicPort", 8443, "Port for the public-facing HTTP proxy server")
