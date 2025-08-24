@@ -18,6 +18,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/krovatkin/proxy-reversed/protocol"
+	"gopkg.in/yaml.v3"
 )
 
 var (
@@ -26,6 +27,54 @@ var (
 	gitCommit  = "unknown"
 	serverPort string
 )
+
+// Config represents the YAML configuration structure
+type Config struct {
+	ServerDomain string `yaml:"serverDomain"`
+	Subdomain    string `yaml:"subdomain"`
+	AuthToken    string `yaml:"authToken"`
+	LocalPort    string `yaml:"localPort"`
+	ServerPort   string `yaml:"serverPort"`
+}
+
+// LoadConfig loads configuration from a YAML file
+func LoadConfig(filename string) (*Config, error) {
+	config := &Config{
+		// Set defaults
+		ServerPort: "7000",
+	}
+
+	// Load from file if provided
+	if filename != "" {
+		data, err := os.ReadFile(filename)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read config file: %w", err)
+		}
+
+		if err := yaml.Unmarshal(data, config); err != nil {
+			return nil, fmt.Errorf("failed to parse config file: %w", err)
+		}
+	}
+
+	return config, nil
+}
+
+// Validate checks if required configuration values are present
+func (c *Config) Validate() error {
+	if c.ServerDomain == "" {
+		return fmt.Errorf("serverDomain is required")
+	}
+	if c.Subdomain == "" {
+		return fmt.Errorf("subdomain is required")
+	}
+	if c.AuthToken == "" {
+		return fmt.Errorf("authToken is required")
+	}
+	if c.LocalPort == "" {
+		return fmt.Errorf("localPort is required")
+	}
+	return nil
+}
 
 type ActiveRequest struct {
 	RawHTTPData *bytes.Buffer
@@ -372,21 +421,20 @@ func (sc *ServiceClient) run() error {
 	return nil
 }
 
-// Add these version variables at the top of the file, after the imports
-
-// Then replace the existing main() function with this:
 func main() {
 	// Print version information
 	log.Printf("Pontivex Client %s (built %s, commit %s)", version, buildDate, gitCommit)
 
-	var (
-		serverDomain   = flag.String("server", "", "Server domain name")
-		subdomain      = flag.String("subdomain", "", "App subdomain to serve requests")
-		authToken      = flag.String("token", "", "Authentication token")
-		localPort      = flag.String("port", "", "Local port to forward requests to")
-		serverPortFlag = flag.String("server-port", "7000", "Server port number")
-		showVersion    = flag.Bool("version", false, "Show version information")
-	)
+	// First pass: define all flags but only use config and version
+	configFile := flag.String("config", "", "Path to YAML configuration file")
+	showVersion := flag.Bool("version", false, "Show version information")
+	// Define other flags but don't use their values yet
+	flag.String("server", "", "Server domain name")
+	flag.String("subdomain", "", "App subdomain to serve requests")
+	flag.String("token", "", "Authentication token")
+	flag.String("port", "", "Local port to forward requests to")
+	flag.String("server-port", "7000", "Server port number")
+
 	flag.Parse()
 
 	if *showVersion {
@@ -396,13 +444,44 @@ func main() {
 		os.Exit(0)
 	}
 
-	serverPort = *serverPortFlag
-
-	if *serverDomain == "" || *subdomain == "" || *authToken == "" || *localPort == "" {
-		log.Fatal("All flags are required: -server, -subdomain, -token, -port")
+	// Load config from file
+	config, err := LoadConfig(*configFile)
+	if err != nil {
+		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	client := NewServiceClient(*serverDomain, *subdomain, *authToken, *localPort)
+	// Reset flag package for second pass
+	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+
+	// Second pass: create flags using config values as defaults
+	flag.String("config", "", "Path to YAML configuration file") // Re-add for help text
+	flag.Bool("version", false, "Show version information")      // Re-add for help text
+	serverDomain := flag.String("server", config.ServerDomain, "Server domain name")
+	subdomain := flag.String("subdomain", config.Subdomain, "App subdomain to serve requests")
+	authToken := flag.String("token", config.AuthToken, "Authentication token")
+	localPort := flag.String("port", config.LocalPort, "Local port to forward requests to")
+	serverPortFlag := flag.String("server-port", config.ServerPort, "Server port number")
+
+	flag.Parse()
+
+	// Copy flag values back to config (flags override config file values)
+	config.ServerDomain = *serverDomain
+	config.Subdomain = *subdomain
+	config.AuthToken = *authToken
+	config.LocalPort = *localPort
+	config.ServerPort = *serverPortFlag
+
+	// Validate configuration
+	if err := config.Validate(); err != nil {
+		fmt.Printf("Configuration error: %v\n", err)
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	// Set global server port
+	serverPort = config.ServerPort
+
+	client := NewServiceClient(config.ServerDomain, config.Subdomain, config.AuthToken, config.LocalPort)
 
 	for {
 		err := client.run()
