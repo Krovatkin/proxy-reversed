@@ -40,9 +40,13 @@ type Config struct {
 	AuthToken   string `yaml:"authToken"`
 }
 
-// LoadConfig loads configuration from a YAML file and merges with flags
-func LoadConfig(filename string, flags *Config) (*Config, error) {
-	config := &Config{}
+// LoadConfig loads configuration from a YAML file
+func LoadConfig(filename string) (*Config, error) {
+	config := &Config{
+		// Set defaults
+		ServicePort: 7000,
+		PublicPort:  8443,
+	}
 
 	// Load from file if provided
 	if filename != "" {
@@ -54,39 +58,6 @@ func LoadConfig(filename string, flags *Config) (*Config, error) {
 		if err := yaml.Unmarshal(data, config); err != nil {
 			return nil, fmt.Errorf("failed to parse config file: %w", err)
 		}
-	}
-
-	// Override with command line flags (flags take precedence)
-	if flags.ServicePort != 7000 { // not default value
-		config.ServicePort = flags.ServicePort
-	} else if config.ServicePort == 0 { // no value from file
-		config.ServicePort = 7000
-	}
-
-	if flags.PublicPort != 8443 { // not default value
-		config.PublicPort = flags.PublicPort
-	} else if config.PublicPort == 0 { // no value from file
-		config.PublicPort = 8443
-	}
-
-	if flags.CertFile != "" {
-		config.CertFile = flags.CertFile
-	}
-
-	if flags.KeyFile != "" {
-		config.KeyFile = flags.KeyFile
-	}
-
-	if flags.SvcCertFile != "" {
-		config.SvcCertFile = flags.SvcCertFile
-	}
-
-	if flags.SvcKeyFile != "" {
-		config.SvcKeyFile = flags.SvcKeyFile
-	}
-
-	if flags.AuthToken != "" {
-		config.AuthToken = flags.AuthToken
 	}
 
 	return config, nil
@@ -445,16 +416,17 @@ func main() {
 
 	server := NewProxyServer()
 
-	// Define command line flags with same names as config struct
+	// First pass: define all flags but only use config and version
 	configFile := flag.String("config", "", "Path to YAML configuration file")
-	servicePort := flag.Int("servicePort", 7000, "Port for the service registration server")
-	publicPort := flag.Int("publicPort", 8443, "Port for the public-facing HTTP proxy server")
-	certFile := flag.String("certFile", "", "Path to the TLS certificate file")
-	keyFile := flag.String("keyFile", "", "Path to the TLS key file")
-	svcCertFile := flag.String("svcCertFile", "", "Path to the TLS certificate file for service registration")
-	svcKeyFile := flag.String("svcKeyFile", "", "Path to the TLS key file for service registration")
-	authTokenFlag := flag.String("authToken", "", "Authentication token")
 	showVersion := flag.Bool("version", false, "Show version information")
+	// Define other flags but don't use their values yet
+	flag.Int("servicePort", 7000, "Port for the service registration server")
+	flag.Int("publicPort", 8443, "Port for the public-facing HTTP proxy server")
+	flag.String("certFile", "", "Path to the TLS certificate file")
+	flag.String("keyFile", "", "Path to the TLS key file")
+	flag.String("svcCertFile", "", "Path to the TLS certificate file for service registration")
+	flag.String("svcKeyFile", "", "Path to the TLS key file for service registration")
+	flag.String("authToken", "", "Authentication token")
 
 	flag.Parse()
 
@@ -465,22 +437,36 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Create flags config struct
-	flagsConfig := &Config{
-		ServicePort: *servicePort,
-		PublicPort:  *publicPort,
-		CertFile:    *certFile,
-		KeyFile:     *keyFile,
-		SvcCertFile: *svcCertFile,
-		SvcKeyFile:  *svcKeyFile,
-		AuthToken:   *authTokenFlag,
-	}
-
-	// Load and merge configuration
-	config, err := LoadConfig(*configFile, flagsConfig)
+	// Load config from file
+	config, err := LoadConfig(*configFile)
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
+
+	// Reset flag package for second pass
+	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+
+	// Second pass: create flags using config values as defaults
+	flag.String("config", "", "Path to YAML configuration file") // Re-add for help text
+	flag.Bool("version", false, "Show version information")      // Re-add for help text
+	servicePort := flag.Int("servicePort", config.ServicePort, "Port for the service registration server")
+	publicPort := flag.Int("publicPort", config.PublicPort, "Port for the public-facing HTTP proxy server")
+	certFile := flag.String("certFile", config.CertFile, "Path to the TLS certificate file")
+	keyFile := flag.String("keyFile", config.KeyFile, "Path to the TLS key file")
+	svcCertFile := flag.String("svcCertFile", config.SvcCertFile, "Path to the TLS certificate file for service registration")
+	svcKeyFile := flag.String("svcKeyFile", config.SvcKeyFile, "Path to the TLS key file for service registration")
+	authTokenFlag := flag.String("authToken", config.AuthToken, "Authentication token")
+
+	flag.Parse()
+
+	// Copy flag values back to config (flags override config file values)
+	config.ServicePort = *servicePort
+	config.PublicPort = *publicPort
+	config.CertFile = *certFile
+	config.KeyFile = *keyFile
+	config.SvcCertFile = *svcCertFile
+	config.SvcKeyFile = *svcKeyFile
+	config.AuthToken = *authTokenFlag
 
 	// Validate configuration
 	if err := config.Validate(); err != nil {
