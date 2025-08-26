@@ -90,3 +90,22 @@ type ProxyRawRequestEnd struct {
 	ID       string `json:"id"`
 	ChunkNum int    `json:"chunk_num"`
 }
+
+type SSHTunnelRegistrationMessage struct {
+	Type      string `json:"type"` // "ssh_tunnel_register"
+	AuthToken string `json:"authToken"`
+	LocalPort int    `json:"localPort"`
+}
+
+type SSHConnectionRequest struct {
+	Type         string `json:"type"` // "ssh_connection_request"
+	ConnectionID string `json:"connectionId"`
+}
+
+type SSHDataChunk struct {
+	Type     string `json:"type"` // "ssh_data_chunk"
+	ID       string `json:"id"`   // Connection ID
+	Data     string `json:"data"` // Base64 encoded data
+	EOS      bool   `json:"eos"`  // End of stream
+	ChunkNum int    `json:"chunkNum"`
+}

@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"os"
@@ -35,6 +36,7 @@ type Config struct {
 	AuthToken    string `yaml:"authToken"`
 	LocalPort    string `yaml:"localPort"`
 	ServerPort   string `yaml:"serverPort"`
+	SSHPort      int    `yaml:"sshPort"`
 }
 
 // LoadConfig loads configuration from a YAML file
@@ -42,6 +44,7 @@ func LoadConfig(filename string) (*Config, error) {
 	config := &Config{
 		// Set defaults
 		ServerPort: "7000",
+		SSHPort:    0, // SSH disabled by default
 	}
 
 	// Load from file if provided
@@ -99,8 +102,10 @@ type ServiceClient struct {
 	subdomain    string
 	authToken    string
 	localPort    string
+	sshPort      int // Local SSH port (22)
 	conn         *websocket.Conn
 	activeReqs   map[string]*ActiveRequest
+	sshConns     map[string]net.Conn // connectionID -> local SSH connection
 	reqMu        sync.RWMutex
 	connMu       sync.Mutex
 }
@@ -111,8 +116,15 @@ func NewServiceClient(serverDomain, subdomain, authToken, localPort string) *Ser
 		subdomain:    subdomain,
 		authToken:    authToken,
 		localPort:    localPort,
+		sshPort:      0, // SSH disabled by default
 		activeReqs:   make(map[string]*ActiveRequest),
+		sshConns:     make(map[string]net.Conn),
 	}
+}
+
+// Method to enable SSH tunneling
+func (sc *ServiceClient) EnableSSH(sshPort int) {
+	sc.sshPort = sshPort
 }
 
 func (sc *ServiceClient) writeJSON(v interface{}) error {
@@ -140,7 +152,7 @@ func (sc *ServiceClient) connect() error {
 	// Set message size limit
 	conn.SetReadLimit(protocol.MessageLimit)
 
-	// Send registration message
+	// Send HTTP service registration message
 	regMsg := protocol.RegistrationMessage{
 		Type:      "register",
 		Subdomain: sc.subdomain,
@@ -152,7 +164,7 @@ func (sc *ServiceClient) connect() error {
 		return fmt.Errorf("failed to send registration: %v", err)
 	}
 
-	// Read confirmation
+	// Read confirmation for HTTP registration
 	var response map[string]interface{}
 	err = conn.ReadJSON(&response)
 	if err != nil {
@@ -160,11 +172,50 @@ func (sc *ServiceClient) connect() error {
 	}
 
 	if response["status"] != "registered" {
-		return fmt.Errorf("registration failed: %v", response)
+		return fmt.Errorf("HTTP registration failed: %v", response)
 	}
 
-	log.Printf("Successfully registered subdomain: %s", sc.subdomain)
+	log.Printf("Successfully registered HTTP subdomain: %s", sc.subdomain)
+
+	// Register SSH tunnel if enabled
+	if sc.sshPort > 0 {
+		err = sc.registerSSHTunnel()
+		if err != nil {
+			return fmt.Errorf("failed to register SSH tunnel: %v", err)
+		}
+
+		// Read SSH tunnel confirmation
+		var sshResponse map[string]interface{}
+		err = conn.ReadJSON(&sshResponse)
+		if err != nil {
+			return fmt.Errorf("failed to read SSH tunnel confirmation: %v", err)
+		}
+
+		if sshResponse["type"] == "ssh_tunnel_registered" {
+			log.Printf("Successfully registered SSH tunnel for subdomain: %s", sc.subdomain)
+			log.Printf("Users can connect with: ssh -o 'VersionAddendum %s' user@%s -p 2200", sc.subdomain, sc.serverDomain)
+		} else {
+			log.Printf("SSH tunnel registration response: %v", sshResponse)
+		}
+	}
+
 	return nil
+}
+
+// Helper method for SSH tunnel registration
+func (sc *ServiceClient) registerSSHTunnel() error {
+	if sc.sshPort == 0 {
+		return nil // SSH not enabled
+	}
+
+	tunnelReg := protocol.SSHTunnelRegistrationMessage{
+		Type:      "ssh_tunnel_register",
+		AuthToken: sc.authToken,
+		LocalPort: sc.sshPort,
+	}
+
+	log.Printf("Registering SSH tunnel: %s -> localhost:%d", sc.subdomain, sc.sshPort)
+	return sc.writeJSON(tunnelReg)
 }
 
 func (sc *ServiceClient) handleRequests() {
@@ -233,10 +284,134 @@ func (sc *ServiceClient) processMessage(rawMsg json.RawMessage) {
 	log.Printf("In processMessage ID = %s type = %s", msgType.ID, msgType.Type)
 
 	switch msgType.Type {
+	// Existing HTTP handling
 	case "raw_http_request_chunk_with_eos":
 		var reqChunk protocol.ProxyRawRequestChunkWithEOS
 		json.Unmarshal(rawMsg, &reqChunk)
 		sc.handleRawRequestChunkWithEOS(reqChunk)
+
+	// New SSH handling
+	case "ssh_connection_request":
+		var connReq protocol.SSHConnectionRequest
+		json.Unmarshal(rawMsg, &connReq)
+		sc.handleSSHConnectionRequest(connReq)
+
+	case "ssh_data_chunk":
+		var chunk protocol.SSHDataChunk
+		json.Unmarshal(rawMsg, &chunk)
+		sc.handleSSHDataChunk(chunk)
+
+	case "ssh_tunnel_registered":
+		var confirm map[string]interface{}
+		json.Unmarshal(rawMsg, &confirm)
+		log.Printf("SSH tunnel registered for subdomain %s", confirm["subdomain"])
+
+	default:
+		log.Printf("Unknown message type: %s", msgType.Type)
+	}
+}
+
+func (sc *ServiceClient) handleSSHConnectionRequest(req protocol.SSHConnectionRequest) {
+	// Connect to local SSH server
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("localhost:%d", sc.sshPort), 15*time.Second)
+	if err != nil {
+		log.Printf("Failed to connect to local SSH server: %v", err)
+		// Send error/close message
+		chunk := protocol.SSHDataChunk{
+			Type:     "ssh_data_chunk",
+			ID:       req.ConnectionID,
+			Data:     "",
+			EOS:      true,
+			ChunkNum: 0,
+		}
+		sc.writeJSON(chunk)
+		return
+	}
+
+	// Store connection
+	sc.reqMu.Lock()
+	sc.sshConns[req.ConnectionID] = conn
+	sc.reqMu.Unlock()
+
+	log.Printf("Established SSH connection %s -> localhost:%d", req.ConnectionID, sc.sshPort)
+
+	// Forward data from local SSH to WebSocket
+	go sc.forwardSSHToWebSocket(conn, req.ConnectionID)
+}
+
+func (sc *ServiceClient) forwardSSHToWebSocket(conn net.Conn, connectionID string) {
+	defer func() {
+		conn.Close()
+		sc.reqMu.Lock()
+		delete(sc.sshConns, connectionID)
+		sc.reqMu.Unlock()
+		log.Printf("Closed SSH connection %s", connectionID)
+	}()
+
+	buffer := make([]byte, protocol.ChunkSize)
+	chunkNum := 0
+
+	for {
+		n, err := conn.Read(buffer)
+		if err != nil {
+			// Send EOS
+			chunk := protocol.SSHDataChunk{
+				Type:     "ssh_data_chunk",
+				ID:       connectionID,
+				Data:     "",
+				EOS:      true,
+				ChunkNum: chunkNum,
+			}
+			sc.writeJSON(chunk)
+			log.Printf("Sent EOS for SSH connection %s", connectionID)
+			break
+		}
+
+		chunk := protocol.SSHDataChunk{
+			Type:     "ssh_data_chunk",
+			ID:       connectionID,
+			Data:     base64.StdEncoding.EncodeToString(buffer[:n]),
+			EOS:      false,
+			ChunkNum: chunkNum,
+		}
+
+		if err := sc.writeJSON(chunk); err != nil {
+			log.Printf("Failed to send SSH data for %s: %v", connectionID, err)
+			break
+		}
+		chunkNum++
+	}
+}
+
+func (sc *ServiceClient) handleSSHDataChunk(chunk protocol.SSHDataChunk) {
+	sc.reqMu.RLock()
+	conn, exists := sc.sshConns[chunk.ID]
+	sc.reqMu.RUnlock()
+
+	if !exists {
+		log.Printf("SSH connection %s not found", chunk.ID)
+		return
+	}
+
+	if chunk.Data != "" {
+		data, err := base64.StdEncoding.DecodeString(chunk.Data)
+		if err != nil {
+			log.Printf("Failed to decode SSH data: %v", err)
+			return
+		}
+
+		_, err = conn.Write(data)
+		if err != nil {
+			log.Printf("Failed to write SSH data: %v", err)
+		}
+	}
+
+	if chunk.EOS {
+		sc.reqMu.Lock()
+		delete(sc.sshConns, chunk.ID)
+		sc.reqMu.Unlock()
+		conn.Close()
+		log.Printf("Closed SSH connection %s (EOS)", chunk.ID)
 	}
 }
 
@@ -417,6 +592,11 @@ func (sc *ServiceClient) run() error {
 	log.Printf("Service client running - forwarding %s.%s:8443 -> localhost:%s",
 		sc.subdomain, sc.serverDomain, sc.localPort)
 
+	if sc.sshPort > 0 {
+		log.Printf("SSH tunnel enabled - users can connect with:")
+		log.Printf("  ssh -o 'VersionAddendum %s' user@%s -p 2200", sc.subdomain, sc.serverDomain)
+	}
+
 	sc.handleRequests()
 	return nil
 }
@@ -434,6 +614,7 @@ func main() {
 	flag.String("token", "", "Authentication token")
 	flag.String("port", "", "Local port to forward requests to")
 	flag.String("server-port", "7000", "Server port number")
+	flag.Int("ssh-port", 0, "Local SSH port to forward SSH connections to (0 to disable)")
 
 	flag.Parse()
 
@@ -461,6 +642,7 @@ func main() {
 	authToken := flag.String("token", config.AuthToken, "Authentication token")
 	localPort := flag.String("port", config.LocalPort, "Local port to forward requests to")
 	serverPortFlag := flag.String("server-port", config.ServerPort, "Server port number")
+	sshPortFlag := flag.Int("ssh-port", config.SSHPort, "Local SSH port to forward SSH connections to (0 to disable)")
 
 	flag.Parse()
 
@@ -470,6 +652,7 @@ func main() {
 	config.AuthToken = *authToken
 	config.LocalPort = *localPort
 	config.ServerPort = *serverPortFlag
+	config.SSHPort = *sshPortFlag
 
 	// Validate configuration
 	if err := config.Validate(); err != nil {
@@ -482,6 +665,11 @@ func main() {
 	serverPort = config.ServerPort
 
 	client := NewServiceClient(config.ServerDomain, config.Subdomain, config.AuthToken, config.LocalPort)
+
+	// Enable SSH if configured
+	if config.SSHPort > 0 {
+		client.EnableSSH(config.SSHPort)
+	}
 
 	for {
 		err := client.run()

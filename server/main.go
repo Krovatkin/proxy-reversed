@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"os"
@@ -33,6 +34,7 @@ var (
 type Config struct {
 	ServicePort int    `yaml:"servicePort"`
 	PublicPort  int    `yaml:"publicPort"`
+	SSHPort     int    `yaml:"sshPort"`
 	CertFile    string `yaml:"certFile"`
 	KeyFile     string `yaml:"keyFile"`
 	SvcCertFile string `yaml:"svcCertFile"`
@@ -46,6 +48,7 @@ func LoadConfig(filename string) (*Config, error) {
 		// Set defaults
 		ServicePort: 7000,
 		PublicPort:  8443,
+		SSHPort:     2200,
 	}
 
 	// Load from file if provided
@@ -84,10 +87,11 @@ func (c *Config) Validate() error {
 }
 
 type ServiceConnection struct {
-	conn      *websocket.Conn
-	subdomain string
-	requestID int64
-	mu        sync.RWMutex
+	conn       *websocket.Conn
+	subdomain  string
+	requestID  int64
+	sshEnabled bool
+	mu         sync.RWMutex
 }
 
 type PendingResponse struct {
@@ -107,7 +111,9 @@ func NewPendingResponse(requestID string, w http.ResponseWriter) *PendingRespons
 }
 
 type ProxyServer struct {
-	services    map[string]*ServiceConnection
+	services    map[string]*ServiceConnection // subdomain -> connection
+	sshServices map[string]*ServiceConnection // subdomain -> connection (for SSH)
+	sshConns    map[string]net.Conn           // connectionID -> TCP connection
 	mu          sync.RWMutex
 	upgrader    websocket.Upgrader
 	pendingReqs map[string]*PendingResponse
@@ -116,7 +122,9 @@ type ProxyServer struct {
 
 func NewProxyServer() *ProxyServer {
 	return &ProxyServer{
-		services: make(map[string]*ServiceConnection),
+		services:    make(map[string]*ServiceConnection),
+		sshServices: make(map[string]*ServiceConnection),
+		sshConns:    make(map[string]net.Conn),
 		upgrader: websocket.Upgrader{
 			CheckOrigin:     func(r *http.Request) bool { return true },
 			ReadBufferSize:  32 * 1024,
@@ -143,6 +151,200 @@ func fastExtractID(data []byte) string {
 	}
 
 	return string(data[start : start+end])
+}
+
+// Start SSH tunnel listener - single port for all subdomains
+func (ps *ProxyServer) startSSHTunnelListener(port int) {
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		log.Fatalf("Failed to start SSH tunnel listener: %v", err)
+	}
+	defer listener.Close()
+
+	log.Printf("SSH tunnel listener started on port %d", port)
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Printf("Failed to accept SSH connection: %v", err)
+			continue
+		}
+
+		go ps.handleSSHConnection(conn)
+	}
+}
+
+func extractSubdomainFromSSHVersion(versionString string) string {
+	// Look for space-separated addendum first
+	if spaceIndex := strings.LastIndex(versionString, " "); spaceIndex != -1 {
+		return strings.TrimSpace(versionString[spaceIndex+1:])
+	}
+
+	// Fallback to dash-separated parsing
+	parts := strings.Split(versionString, "-")
+	if len(parts) >= 4 {
+		return parts[len(parts)-1]
+	}
+
+	return ""
+}
+
+func (ps *ProxyServer) handleSSHConnection(conn net.Conn) {
+	defer conn.Close()
+
+	buffer := make([]byte, protocol.ChunkSize)
+	chunkNum := 0
+	var service *ServiceConnection
+	var finalConnectionID string
+	subdomainExtracted := false
+
+	for {
+		n, err := conn.Read(buffer)
+		if err != nil {
+			if service != nil {
+				// Send EOS chunk
+				chunk := protocol.SSHDataChunk{
+					Type:     "ssh_data_chunk",
+					ID:       finalConnectionID,
+					Data:     "",
+					EOS:      true,
+					ChunkNum: chunkNum,
+				}
+				service.mu.Lock()
+				service.conn.WriteJSON(chunk)
+				service.mu.Unlock()
+				log.Printf("Sent EOS for SSH connection %s", finalConnectionID)
+			}
+			break
+		}
+
+		// First chunk - extract subdomain from ProxyCommand prefix
+		if !subdomainExtracted {
+			data := string(buffer[:n])
+
+			// Look for subdomain in first line (sent by ProxyCommand)
+			lines := strings.Split(data, "\n")
+			if len(lines) > 0 {
+				firstLine := strings.TrimSpace(lines[0])
+
+				var subdomain string
+				var sshDataStart int
+
+				// Check if first line is subdomain (not SSH version)
+				if !strings.HasPrefix(firstLine, "SSH-") {
+					// First line is subdomain from ProxyCommand
+					subdomain = firstLine
+					log.Printf("Extracted subdomain from ProxyCommand: %s", subdomain)
+
+					// Find where SSH data starts (after first \n)
+					if newlinePos := strings.Index(data, "\n"); newlinePos != -1 {
+						sshDataStart = newlinePos + 1
+					}
+				} else {
+					// Fallback: try to extract from SSH version string (your original logic)
+					if strings.HasPrefix(data, "SSH-2.0") || strings.HasPrefix(data, "SSH-1.") {
+						clientVersion := firstLine
+						log.Printf("Received SSH version: %s", clientVersion)
+						subdomain = extractSubdomainFromSSHVersion(clientVersion)
+						sshDataStart = 0 // All data is SSH data
+					}
+				}
+
+				if subdomain == "" {
+					log.Printf("No subdomain found in connection data")
+					return
+				}
+
+				// Find the SSH service
+				ps.mu.RLock()
+				var exists bool
+				service, exists = ps.sshServices[subdomain]
+				ps.mu.RUnlock()
+
+				if !exists {
+					log.Printf("No SSH tunnel registered for subdomain: %s", subdomain)
+					return
+				}
+
+				// Setup connection
+				finalConnectionID = fmt.Sprintf("ssh-%s-%d", subdomain, time.Now().UnixNano())
+
+				log.Printf("New SSH connection %s for subdomain %s", finalConnectionID, subdomain)
+
+				// Send connection request to client
+				connReq := protocol.SSHConnectionRequest{
+					Type:         "ssh_connection_request",
+					ConnectionID: finalConnectionID,
+				}
+
+				service.mu.Lock()
+				err = service.conn.WriteJSON(connReq)
+				service.mu.Unlock()
+
+				if err != nil {
+					log.Printf("Failed to send SSH connection request: %v", err)
+					return
+				}
+
+				ps.mu.Lock()
+				ps.sshConns[finalConnectionID] = conn
+				ps.mu.Unlock()
+
+				defer func() {
+					ps.mu.Lock()
+					delete(ps.sshConns, finalConnectionID)
+					ps.mu.Unlock()
+					log.Printf("Cleaned up SSH connection %s", finalConnectionID)
+				}()
+
+				subdomainExtracted = true
+
+				// If we have SSH data after the subdomain in this chunk, send it
+				if sshDataStart > 0 && sshDataStart < n {
+					sshData := buffer[sshDataStart:n]
+					chunk := protocol.SSHDataChunk{
+						Type:     "ssh_data_chunk",
+						ID:       finalConnectionID,
+						Data:     base64.StdEncoding.EncodeToString(sshData),
+						EOS:      false,
+						ChunkNum: chunkNum,
+					}
+
+					service.mu.Lock()
+					writeErr := service.conn.WriteJSON(chunk)
+					service.mu.Unlock()
+
+					if writeErr != nil {
+						log.Printf("Failed to send SSH data chunk: %v", writeErr)
+						break
+					}
+					chunkNum++
+				}
+			}
+		} else {
+			// Forward the chunk if we have a service (all subsequent chunks are SSH data)
+			if service != nil {
+				chunk := protocol.SSHDataChunk{
+					Type:     "ssh_data_chunk",
+					ID:       finalConnectionID,
+					Data:     base64.StdEncoding.EncodeToString(buffer[:n]),
+					EOS:      false,
+					ChunkNum: chunkNum,
+				}
+
+				service.mu.Lock()
+				writeErr := service.conn.WriteJSON(chunk)
+				service.mu.Unlock()
+
+				if writeErr != nil {
+					log.Printf("Failed to send SSH data chunk: %v", writeErr)
+					break
+				}
+
+				chunkNum++
+			}
+		}
+	}
 }
 
 func (ps *ProxyServer) handleServiceRegistration(w http.ResponseWriter, r *http.Request) {
@@ -201,41 +403,150 @@ func (ps *ProxyServer) handleServiceRegistration(w http.ResponseWriter, r *http.
 			break
 		}
 
-		ps.handleServiceMessage(rawMsg)
+		ps.handleServiceMessage(rawMsg, regMsg.Subdomain, service)
 	}
 
 	// Cleanup
-	ps.mu.Lock()
-	delete(ps.services, regMsg.Subdomain)
-	ps.mu.Unlock()
+	ps.cleanupService(regMsg.Subdomain)
 	log.Printf("Service %s disconnected", regMsg.Subdomain)
 }
 
-func (ps *ProxyServer) handleServiceMessage(rawMsg json.RawMessage) {
-	// Fast ID extraction - minimal parsing on critical path
-	id := fastExtractID(rawMsg)
-	if id == "" {
-		log.Printf("Failed to extract ID from message")
+func (ps *ProxyServer) handleServiceMessage(rawMsg json.RawMessage, subdomain string, service *ServiceConnection) {
+	// Extract type first
+	var msgType struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(rawMsg, &msgType); err != nil {
+		log.Printf("Failed to parse message type: %v", err)
 		return
 	}
 
-	log.Printf("Received rawMsg w/ ID %s", id)
+	switch msgType.Type {
+	case "ssh_tunnel_register":
+		var sshReg protocol.SSHTunnelRegistrationMessage
+		if err := json.Unmarshal(rawMsg, &sshReg); err != nil {
+			log.Printf("Failed to parse SSH registration: %v", err)
+			return
+		}
+		ps.handleSSHTunnelRegistration(sshReg, subdomain, service)
 
-	ps.reqMu.RLock()
-	activeResp, exists := ps.pendingReqs[id]
-	ps.reqMu.RUnlock()
+	case "ssh_data_chunk":
+		var chunk protocol.SSHDataChunk
+		if err := json.Unmarshal(rawMsg, &chunk); err != nil {
+			log.Printf("Failed to parse SSH data chunk: %v", err)
+			return
+		}
+		ps.handleSSHDataChunk(chunk)
+
+	default:
+		// Handle existing HTTP messages
+		id := fastExtractID(rawMsg)
+		if id == "" {
+			log.Printf("Failed to extract ID from message")
+			return
+		}
+
+		log.Printf("Received rawMsg w/ ID %s", id)
+
+		ps.reqMu.RLock()
+		activeResp, exists := ps.pendingReqs[id]
+		ps.reqMu.RUnlock()
+
+		if !exists {
+			log.Printf("ID %s doesn't exist", id)
+			return
+		}
+
+		// Forward raw JSON - parsing happens later when actually needed
+		select {
+		case activeResp.ResponseChan <- rawMsg:
+		case <-time.After(1 * time.Second):
+			log.Printf("Failed to send response message, channel blocked")
+		}
+	}
+}
+
+func (ps *ProxyServer) handleSSHTunnelRegistration(reg protocol.SSHTunnelRegistrationMessage, subdomain string, service *ServiceConnection) {
+	log.Printf("Registered SSH tunnel for subdomain: %s (local port: %d)", subdomain, reg.LocalPort)
+
+	// Mark SSH as enabled for this service
+	service.mu.Lock()
+	service.sshEnabled = true
+	service.mu.Unlock()
+
+	// Register SSH service
+	ps.mu.Lock()
+	ps.sshServices[subdomain] = service
+	ps.mu.Unlock()
+
+	// Send confirmation
+	confirmMsg := map[string]interface{}{
+		"type":      "ssh_tunnel_registered",
+		"subdomain": subdomain,
+		"localPort": reg.LocalPort,
+		"sshPort":   2200, // Single SSH port for all subdomains
+	}
+	service.conn.WriteJSON(confirmMsg)
+}
+
+func (ps *ProxyServer) handleSSHDataChunk(chunk protocol.SSHDataChunk) {
+	ps.mu.RLock()
+	conn, exists := ps.sshConns[chunk.ID]
+	ps.mu.RUnlock()
 
 	if !exists {
-		log.Printf("ID %s doesn't exist", id)
+		log.Printf("SSH connection %s not found", chunk.ID)
 		return
 	}
 
-	// Forward raw JSON - parsing happens later when actually needed
-	select {
-	case activeResp.ResponseChan <- rawMsg:
-	case <-time.After(1 * time.Second):
-		log.Printf("Failed to send response message, channel blocked")
+	if chunk.Data != "" {
+		data, err := base64.StdEncoding.DecodeString(chunk.Data)
+		if err != nil {
+			log.Printf("Failed to decode SSH data: %v", err)
+			return
+		}
+
+		_, err = conn.Write(data)
+		if err != nil {
+			log.Printf("Failed to write to SSH connection %s: %v", chunk.ID, err)
+			ps.mu.Lock()
+			delete(ps.sshConns, chunk.ID)
+			ps.mu.Unlock()
+			conn.Close()
+		}
 	}
+
+	if chunk.EOS {
+		log.Printf("Closing SSH connection %s (EOS received)", chunk.ID)
+		ps.mu.Lock()
+		delete(ps.sshConns, chunk.ID)
+		ps.mu.Unlock()
+		conn.Close()
+	}
+}
+
+func (ps *ProxyServer) cleanupService(subdomain string) {
+	ps.mu.Lock()
+	delete(ps.services, subdomain)
+	delete(ps.sshServices, subdomain)
+
+	// Close all SSH connections for this subdomain
+	connectionsToClose := make([]string, 0)
+	for connID := range ps.sshConns {
+		if strings.HasPrefix(connID, fmt.Sprintf("ssh-%s-", subdomain)) {
+			connectionsToClose = append(connectionsToClose, connID)
+		}
+	}
+
+	for _, connID := range connectionsToClose {
+		if conn, exists := ps.sshConns[connID]; exists {
+			conn.Close()
+			delete(ps.sshConns, connID)
+		}
+	}
+	ps.mu.Unlock()
+
+	log.Printf("Service %s disconnected, closed %d SSH connections", subdomain, len(connectionsToClose))
 }
 
 func (ps *ProxyServer) handleHTTPProxy(w http.ResponseWriter, r *http.Request) {
@@ -422,6 +733,7 @@ func main() {
 	// Define other flags but don't use their values yet
 	flag.Int("servicePort", 7000, "Port for the service registration server")
 	flag.Int("publicPort", 8443, "Port for the public-facing HTTP proxy server")
+	flag.Int("sshPort", 2200, "Port for SSH tunnel connections")
 	flag.String("certFile", "", "Path to the TLS certificate file")
 	flag.String("keyFile", "", "Path to the TLS key file")
 	flag.String("svcCertFile", "", "Path to the TLS certificate file for service registration")
@@ -451,6 +763,7 @@ func main() {
 	flag.Bool("version", false, "Show version information")      // Re-add for help text
 	servicePort := flag.Int("servicePort", config.ServicePort, "Port for the service registration server")
 	publicPort := flag.Int("publicPort", config.PublicPort, "Port for the public-facing HTTP proxy server")
+	sshPort := flag.Int("sshPort", config.SSHPort, "Port for SSH tunnel connections")
 	certFile := flag.String("certFile", config.CertFile, "Path to the TLS certificate file")
 	keyFile := flag.String("keyFile", config.KeyFile, "Path to the TLS key file")
 	svcCertFile := flag.String("svcCertFile", config.SvcCertFile, "Path to the TLS certificate file for service registration")
@@ -462,6 +775,7 @@ func main() {
 	// Copy flag values back to config (flags override config file values)
 	config.ServicePort = *servicePort
 	config.PublicPort = *publicPort
+	config.SSHPort = *sshPort
 	config.CertFile = *certFile
 	config.KeyFile = *keyFile
 	config.SvcCertFile = *svcCertFile
@@ -477,6 +791,11 @@ func main() {
 
 	// Set global auth token
 	authToken = config.AuthToken
+
+	// SSH tunnel listener
+	if config.SSHPort > 0 {
+		go server.startSSHTunnelListener(config.SSHPort)
+	}
 
 	// Service registration server
 	go func() {
@@ -516,5 +835,8 @@ func main() {
 	}
 
 	log.Printf("HTTP proxy server starting on :%d", config.PublicPort)
+	if config.SSHPort > 0 {
+		log.Printf("SSH tunnel server starting on :%d", config.SSHPort)
+	}
 	log.Fatal(srv.ListenAndServeTLS(config.CertFile, config.KeyFile))
 }
