@@ -98,8 +98,9 @@ type SSHTunnelRegistrationMessage struct {
 }
 
 type SSHConnectionRequest struct {
-	Type         string `json:"type"` // "ssh_connection_request"
-	ConnectionID string `json:"connectionId"`
+	Type     string `json:"type"` // "ssh_connection_request"
+	ID       string `json:"id"`
+	ChunkNum int    `json:"chunkNum"`
 }
 
 type SSHDataChunk struct {

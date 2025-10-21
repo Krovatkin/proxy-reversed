@@ -80,18 +80,17 @@ func (c *Config) Validate() error {
 }
 
 type ActiveRequest struct {
-	RawHTTPData *bytes.Buffer
-	ID          string
-	mu          sync.Mutex
-	nextChunk   int
-	chunkCond   *sync.Cond
+	ID        string
+	mu        sync.Mutex
+	nextChunk int
+	chunkCond *sync.Cond
+	payload   interface{} // Can be *bytes.Buffer for HTTP or net.Conn for SSH
 }
 
-func NewActiveRequest(requestID string) *ActiveRequest {
+func NewActiveRequestHTTP(requestID string) *ActiveRequest {
 	req := &ActiveRequest{
-		ID:          requestID,
-		RawHTTPData: bytes.NewBuffer(nil),
-		nextChunk:   0,
+		ID:      requestID,
+		payload: bytes.NewBuffer(nil),
 	}
 	req.chunkCond = sync.NewCond(&req.mu)
 	return req
@@ -104,8 +103,7 @@ type ServiceClient struct {
 	localPort    string
 	sshPort      int // Local SSH port (22)
 	conn         *websocket.Conn
-	activeReqs   map[string]*ActiveRequest
-	sshConns     map[string]net.Conn // connectionID -> local SSH connection
+	activeReqs   map[string]*ActiveRequest // Unified map for both HTTP and SSH
 	reqMu        sync.RWMutex
 	connMu       sync.Mutex
 }
@@ -118,7 +116,6 @@ func NewServiceClient(serverDomain, subdomain, authToken, localPort string) *Ser
 		localPort:    localPort,
 		sshPort:      0, // SSH disabled by default
 		activeReqs:   make(map[string]*ActiveRequest),
-		sshConns:     make(map[string]net.Conn),
 	}
 }
 
@@ -230,6 +227,7 @@ func (sc *ServiceClient) handleRequests() {
 		}
 
 		err = json.Unmarshal(rawMsg, &baseReq)
+		log.Printf("Received RawMsg ID = %s, ChunkNum = %d, Type = %s", baseReq.ID, baseReq.ChunkNum, baseReq.Type)
 		if err != nil {
 			log.Printf("Failed to parse base message: %v", err)
 			continue
@@ -240,7 +238,10 @@ func (sc *ServiceClient) handleRequests() {
 		sc.reqMu.RUnlock()
 
 		if !exists {
-			req = NewActiveRequest(baseReq.ID)
+			req = &ActiveRequest{
+				ID: baseReq.ID,
+			}
+			req.chunkCond = sync.NewCond(&req.mu)
 			sc.reqMu.Lock()
 			sc.activeReqs[baseReq.ID] = req
 			sc.reqMu.Unlock()
@@ -251,6 +252,8 @@ func (sc *ServiceClient) handleRequests() {
 }
 
 func (sc *ServiceClient) processChunkWhenReady(req *ActiveRequest, rawMsg json.RawMessage, chunkID int) {
+
+	log.Printf("Ready to process chunk %d for request ID %s", chunkID, req.ID)
 	// Wait until it's this chunk's turn
 	req.mu.Lock()
 	for req.nextChunk != chunkID {
@@ -272,8 +275,9 @@ func (sc *ServiceClient) processChunkWhenReady(req *ActiveRequest, rawMsg json.R
 
 func (sc *ServiceClient) processMessage(rawMsg json.RawMessage) {
 	var msgType struct {
-		Type string `json:"type"`
-		ID   string `json:"id"`
+		Type     string `json:"type"`
+		ID       string `json:"id"`
+		ChunkNum int    `json:"chunkNum"`
 	}
 
 	if err := json.Unmarshal(rawMsg, &msgType); err != nil {
@@ -281,7 +285,7 @@ func (sc *ServiceClient) processMessage(rawMsg json.RawMessage) {
 		return
 	}
 
-	log.Printf("In processMessage ID = %s type = %s", msgType.ID, msgType.Type)
+	log.Printf("Received rawMsg ID = %s type = %s chunkNum = %d", msgType.ID, msgType.Type, msgType.ChunkNum)
 
 	switch msgType.Type {
 	// Existing HTTP handling
@@ -319,7 +323,7 @@ func (sc *ServiceClient) handleSSHConnectionRequest(req protocol.SSHConnectionRe
 		// Send error/close message
 		chunk := protocol.SSHDataChunk{
 			Type:     "ssh_data_chunk",
-			ID:       req.ConnectionID,
+			ID:       req.ID,
 			Data:     "",
 			EOS:      true,
 			ChunkNum: 0,
@@ -328,22 +332,27 @@ func (sc *ServiceClient) handleSSHConnectionRequest(req protocol.SSHConnectionRe
 		return
 	}
 
-	// Store connection
+	// Update the existing ActiveRequest with the SSH connection
 	sc.reqMu.Lock()
-	sc.sshConns[req.ConnectionID] = conn
+	activeReq, exists := sc.activeReqs[req.ID]
+	if exists {
+		activeReq.payload = conn
+	} else {
+		log.Printf("ActiveRequest with connectionID %s not found", req.ID)
+	}
 	sc.reqMu.Unlock()
 
-	log.Printf("Established SSH connection %s -> localhost:%d", req.ConnectionID, sc.sshPort)
+	log.Printf("Established SSH connection %s -> localhost:%d", req.ID, sc.sshPort)
 
 	// Forward data from local SSH to WebSocket
-	go sc.forwardSSHToWebSocket(conn, req.ConnectionID)
+	go sc.forwardSSHToWebSocket(conn, req.ID)
 }
 
 func (sc *ServiceClient) forwardSSHToWebSocket(conn net.Conn, connectionID string) {
 	defer func() {
 		conn.Close()
 		sc.reqMu.Lock()
-		delete(sc.sshConns, connectionID)
+		delete(sc.activeReqs, connectionID)
 		sc.reqMu.Unlock()
 		log.Printf("Closed SSH connection %s", connectionID)
 	}()
@@ -385,11 +394,17 @@ func (sc *ServiceClient) forwardSSHToWebSocket(conn net.Conn, connectionID strin
 
 func (sc *ServiceClient) handleSSHDataChunk(chunk protocol.SSHDataChunk) {
 	sc.reqMu.RLock()
-	conn, exists := sc.sshConns[chunk.ID]
+	activeReq, exists := sc.activeReqs[chunk.ID]
 	sc.reqMu.RUnlock()
 
 	if !exists {
 		log.Printf("SSH connection %s not found", chunk.ID)
+		return
+	}
+
+	conn, ok := activeReq.payload.(net.Conn)
+	if !ok {
+		log.Printf("Invalid payload type for SSH connection %s", chunk.ID)
 		return
 	}
 
@@ -408,7 +423,7 @@ func (sc *ServiceClient) handleSSHDataChunk(chunk protocol.SSHDataChunk) {
 
 	if chunk.EOS {
 		sc.reqMu.Lock()
-		delete(sc.sshConns, chunk.ID)
+		delete(sc.activeReqs, chunk.ID)
 		sc.reqMu.Unlock()
 		conn.Close()
 		log.Printf("Closed SSH connection %s (EOS)", chunk.ID)
@@ -417,8 +432,24 @@ func (sc *ServiceClient) handleSSHDataChunk(chunk protocol.SSHDataChunk) {
 
 func (sc *ServiceClient) handleRawRequestChunkWithEOS(chunk protocol.ProxyRawRequestChunkWithEOS) {
 	sc.reqMu.RLock()
-	activeReq := sc.activeReqs[chunk.ID]
+	activeReq, exists := sc.activeReqs[chunk.ID]
 	sc.reqMu.RUnlock()
+
+	if !exists {
+		log.Printf("HTTP request %s not found", chunk.ID)
+		return
+	}
+
+	// Ensure we have an HTTP buffer payload
+	if activeReq.payload == nil {
+		activeReq.payload = bytes.NewBuffer(nil)
+	}
+
+	httpBuffer, ok := activeReq.payload.(*bytes.Buffer)
+	if !ok {
+		log.Printf("Invalid payload type for HTTP request %s", chunk.ID)
+		return
+	}
 
 	if chunk.Data != "" {
 		data, err := base64.StdEncoding.DecodeString(chunk.Data)
@@ -428,15 +459,11 @@ func (sc *ServiceClient) handleRawRequestChunkWithEOS(chunk protocol.ProxyRawReq
 		}
 
 		activeReq.mu.Lock()
-		activeReq.RawHTTPData.Write(data)
+		httpBuffer.Write(data)
 		activeReq.mu.Unlock()
 	}
 
 	if chunk.EOS {
-		sc.reqMu.RLock()
-		activeReq = sc.activeReqs[chunk.ID]
-		sc.reqMu.RUnlock()
-
 		sc.executeRawRequest(activeReq)
 
 		sc.reqMu.Lock()
@@ -446,8 +473,15 @@ func (sc *ServiceClient) handleRawRequestChunkWithEOS(chunk protocol.ProxyRawReq
 }
 
 func (sc *ServiceClient) executeRawRequest(activeReq *ActiveRequest) {
+	httpBuffer, ok := activeReq.payload.(*bytes.Buffer)
+	if !ok {
+		log.Printf("Invalid payload type for HTTP request %s", activeReq.ID)
+		sc.sendErrorResponse(activeReq.ID, 500, "Invalid request payload")
+		return
+	}
+
 	// Parse the raw HTTP data
-	req, err := sc.createRequestFromRawHTTP(activeReq.RawHTTPData.String())
+	req, err := sc.createRequestFromRawHTTP(httpBuffer.String())
 	if err != nil {
 		log.Printf("Failed to create request: %v", err)
 		sc.sendErrorResponse(activeReq.ID, 500, "Failed to parse request")
@@ -602,6 +636,7 @@ func (sc *ServiceClient) run() error {
 }
 
 func main() {
+	log.SetFlags(log.LstdFlags | log.Llongfile)
 	// Print version information
 	log.Printf("Pontivex Client %s (built %s, commit %s)", version, buildDate, gitCommit)
 

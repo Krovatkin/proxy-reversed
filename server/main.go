@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/krovatkin/proxy-reversed/protocol"
 	"gopkg.in/yaml.v3"
@@ -192,6 +193,7 @@ func extractSubdomainFromSSHVersion(versionString string) string {
 func (ps *ProxyServer) handleSSHConnection(conn net.Conn) {
 	defer conn.Close()
 
+	log.Printf("Opening an ssh connection")
 	buffer := make([]byte, protocol.ChunkSize)
 	chunkNum := 0
 	var service *ServiceConnection
@@ -267,14 +269,15 @@ func (ps *ProxyServer) handleSSHConnection(conn net.Conn) {
 				}
 
 				// Setup connection
-				finalConnectionID = fmt.Sprintf("ssh-%s-%d", subdomain, time.Now().UnixNano())
+				finalConnectionID = fmt.Sprintf("ssh-%s-%s", subdomain, uuid.New().String())
 
 				log.Printf("New SSH connection %s for subdomain %s", finalConnectionID, subdomain)
 
 				// Send connection request to client
 				connReq := protocol.SSHConnectionRequest{
-					Type:         "ssh_connection_request",
-					ConnectionID: finalConnectionID,
+					Type:     "ssh_connection_request",
+					ID:       finalConnectionID,
+					ChunkNum: chunkNum,
 				}
 
 				service.mu.Lock()
@@ -285,6 +288,8 @@ func (ps *ProxyServer) handleSSHConnection(conn net.Conn) {
 					log.Printf("Failed to send SSH connection request: %v", err)
 					return
 				}
+
+				chunkNum++
 
 				ps.mu.Lock()
 				ps.sshConns[finalConnectionID] = conn
@@ -572,7 +577,7 @@ func (ps *ProxyServer) handleHTTPProxy(w http.ResponseWriter, r *http.Request) {
 	ps.mu.Unlock()
 
 	// Generate request ID
-	reqID := fmt.Sprintf("%s-%d-%d", subdomain, requestID, time.Now().UnixNano())
+	reqID := fmt.Sprintf("%s-%d-%s", subdomain, requestID, uuid.New().String())
 	log.Printf("Assigned reqID %s to a new http(s) request", reqID)
 
 	// Register pending request with PendingResponse
