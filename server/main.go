@@ -3,8 +3,10 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/md5"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -175,20 +177,6 @@ func (ps *ProxyServer) startSSHTunnelListener(port int) {
 	}
 }
 
-func extractSubdomainFromSSHVersion(versionString string) string {
-	// Look for space-separated addendum first
-	if spaceIndex := strings.LastIndex(versionString, " "); spaceIndex != -1 {
-		return strings.TrimSpace(versionString[spaceIndex+1:])
-	}
-
-	// Fallback to dash-separated parsing
-	parts := strings.Split(versionString, "-")
-	if len(parts) >= 4 {
-		return parts[len(parts)-1]
-	}
-
-	return ""
-}
 
 func (ps *ProxyServer) handleSSHConnection(conn net.Conn) {
 	defer conn.Close()
@@ -224,107 +212,105 @@ func (ps *ProxyServer) handleSSHConnection(conn net.Conn) {
 		if !subdomainExtracted {
 			data := string(buffer[:n])
 
-			// Look for subdomain in first line (sent by ProxyCommand)
-			lines := strings.Split(data, "\n")
-			if len(lines) > 0 {
-				firstLine := strings.TrimSpace(lines[0])
+			var subdomain string
+			var sshDataStart int
 
-				var subdomain string
-				var sshDataStart int
+			// Look for semicolon delimiter sent by ProxyCommand (e.g., "app1;")
+			semiPos := strings.Index(data, ";")
+			if semiPos == -1 {
+				// No semicolon found - send connection refused and close
+				log.Printf("No semicolon delimiter found in SSH connection data")
+				conn.Write([]byte("SSH connection refused: missing subdomain identifier\r\n"))
+				return
+			}
 
-				// Check if first line is subdomain (not SSH version)
-				if !strings.HasPrefix(firstLine, "SSH-") {
-					// First line is subdomain from ProxyCommand
-					subdomain = firstLine
-					log.Printf("Extracted subdomain from ProxyCommand: %s", subdomain)
+			// Extract subdomain before semicolon
+			subdomain = data[:semiPos]
+			log.Printf("Extracted subdomain from ProxyCommand: %s", subdomain)
 
-					// Find where SSH data starts (after first \n)
-					if newlinePos := strings.Index(data, "\n"); newlinePos != -1 {
-						sshDataStart = newlinePos + 1
-					}
-				} else {
-					// Fallback: try to extract from SSH version string (your original logic)
-					if strings.HasPrefix(data, "SSH-2.0") || strings.HasPrefix(data, "SSH-1.") {
-						clientVersion := firstLine
-						log.Printf("Received SSH version: %s", clientVersion)
-						subdomain = extractSubdomainFromSSHVersion(clientVersion)
-						sshDataStart = 0 // All data is SSH data
-					}
-				}
+			// SSH data starts right after the semicolon
+			sshDataStart = semiPos + 1
 
-				if subdomain == "" {
-					log.Printf("No subdomain found in connection data")
-					return
-				}
+			if subdomain == "" {
+				log.Printf("Empty subdomain found")
+				conn.Write([]byte("SSH connection refused: empty subdomain\r\n"))
+				return
+			}
 
-				// Find the SSH service
-				ps.mu.RLock()
-				var exists bool
-				service, exists = ps.sshServices[subdomain]
-				ps.mu.RUnlock()
+			// Find the SSH service
+			ps.mu.RLock()
+			var exists bool
+			service, exists = ps.sshServices[subdomain]
+			ps.mu.RUnlock()
 
-				if !exists {
-					log.Printf("No SSH tunnel registered for subdomain: %s", subdomain)
-					return
-				}
+			if !exists {
+				log.Printf("No SSH tunnel registered for subdomain: %s", subdomain)
+				conn.Write([]byte("SSH connection refused: subdomain not registered\r\n"))
+				return
+			}
 
-				// Setup connection
-				finalConnectionID = fmt.Sprintf("ssh-%s-%s", subdomain, uuid.New().String())
+			// Setup connection
+			finalConnectionID = fmt.Sprintf("ssh-%s-%s", subdomain, uuid.New().String())
 
-				log.Printf("New SSH connection %s for subdomain %s", finalConnectionID, subdomain)
+			log.Printf("New SSH connection %s for subdomain %s", finalConnectionID, subdomain)
 
-				// Send connection request to client
-				connReq := protocol.SSHConnectionRequest{
-					Type:     "ssh_connection_request",
+			// Send connection request to client
+			connReq := protocol.SSHConnectionRequest{
+				Type:     "ssh_connection_request",
+				ID:       finalConnectionID,
+				ChunkNum: chunkNum,
+			}
+
+			service.mu.Lock()
+			err = service.conn.WriteJSON(connReq)
+			service.mu.Unlock()
+
+			if err != nil {
+				log.Printf("Failed to send SSH connection request: %v", err)
+				return
+			}
+
+			chunkNum++
+
+			ps.mu.Lock()
+			ps.sshConns[finalConnectionID] = conn
+			ps.mu.Unlock()
+
+			defer func() {
+				ps.mu.Lock()
+				delete(ps.sshConns, finalConnectionID)
+				ps.mu.Unlock()
+				log.Printf("Cleaned up SSH connection %s", finalConnectionID)
+			}()
+
+			subdomainExtracted = true
+
+			// If we have SSH data after the subdomain in this chunk, send it
+			if sshDataStart > 0 && sshDataStart < n {
+				sshData := buffer[sshDataStart:n]
+				chunk := protocol.SSHDataChunk{
+					Type:     "ssh_data_chunk",
 					ID:       finalConnectionID,
+					Data:     base64.StdEncoding.EncodeToString(sshData),
+					EOS:      false,
 					ChunkNum: chunkNum,
 				}
 
+				// Marshal and hash the JSON message
+				jsonBytes, _ := json.Marshal(chunk)
+				msgHash := md5.Sum(jsonBytes)
+				msgHashStr := hex.EncodeToString(msgHash[:])
+				log.Printf("SERVER: Sending chunk %d, len=%d, json_md5=%s", chunkNum, len(sshData), msgHashStr)
+
 				service.mu.Lock()
-				err = service.conn.WriteJSON(connReq)
+				writeErr := service.conn.WriteJSON(chunk)
 				service.mu.Unlock()
 
-				if err != nil {
-					log.Printf("Failed to send SSH connection request: %v", err)
-					return
+				if writeErr != nil {
+					log.Printf("Failed to send SSH data chunk: %v", writeErr)
+					break
 				}
-
 				chunkNum++
-
-				ps.mu.Lock()
-				ps.sshConns[finalConnectionID] = conn
-				ps.mu.Unlock()
-
-				defer func() {
-					ps.mu.Lock()
-					delete(ps.sshConns, finalConnectionID)
-					ps.mu.Unlock()
-					log.Printf("Cleaned up SSH connection %s", finalConnectionID)
-				}()
-
-				subdomainExtracted = true
-
-				// If we have SSH data after the subdomain in this chunk, send it
-				if sshDataStart > 0 && sshDataStart < n {
-					sshData := buffer[sshDataStart:n]
-					chunk := protocol.SSHDataChunk{
-						Type:     "ssh_data_chunk",
-						ID:       finalConnectionID,
-						Data:     base64.StdEncoding.EncodeToString(sshData),
-						EOS:      false,
-						ChunkNum: chunkNum,
-					}
-
-					service.mu.Lock()
-					writeErr := service.conn.WriteJSON(chunk)
-					service.mu.Unlock()
-
-					if writeErr != nil {
-						log.Printf("Failed to send SSH data chunk: %v", writeErr)
-						break
-					}
-					chunkNum++
-				}
 			}
 		} else {
 			// Forward the chunk if we have a service (all subsequent chunks are SSH data)
@@ -336,6 +322,12 @@ func (ps *ProxyServer) handleSSHConnection(conn net.Conn) {
 					EOS:      false,
 					ChunkNum: chunkNum,
 				}
+
+				// Marshal and hash the JSON message
+				jsonBytes, _ := json.Marshal(chunk)
+				msgHash := md5.Sum(jsonBytes)
+				msgHashStr := hex.EncodeToString(msgHash[:])
+				log.Printf("SERVER: Sending chunk %d, len=%d, json_md5=%s", chunkNum, n, msgHashStr)
 
 				service.mu.Lock()
 				writeErr := service.conn.WriteJSON(chunk)
@@ -388,7 +380,14 @@ func (ps *ProxyServer) handleServiceRegistration(w http.ResponseWriter, r *http.
 		subdomain: regMsg.Subdomain,
 	}
 
+	// Clean up any existing connection for this subdomain
 	ps.mu.Lock()
+	if oldService, exists := ps.services[regMsg.Subdomain]; exists {
+		log.Printf("Closing stale connection for subdomain: %s", regMsg.Subdomain)
+		oldService.mu.Lock()
+		oldService.conn.Close()
+		oldService.mu.Unlock()
+	}
 	ps.services[regMsg.Subdomain] = service
 	ps.mu.Unlock()
 

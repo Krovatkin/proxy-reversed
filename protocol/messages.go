@@ -100,7 +100,7 @@ type SSHTunnelRegistrationMessage struct {
 type SSHConnectionRequest struct {
 	Type     string `json:"type"` // "ssh_connection_request"
 	ID       string `json:"id"`
-	ChunkNum int    `json:"chunkNum"`
+	ChunkNum int    `json:"chunk_num"`
 }
 
 type SSHDataChunk struct {
@@ -108,5 +108,5 @@ type SSHDataChunk struct {
 	ID       string `json:"id"`   // Connection ID
 	Data     string `json:"data"` // Base64 encoded data
 	EOS      bool   `json:"eos"`  // End of stream
-	ChunkNum int    `json:"chunkNum"`
+	ChunkNum int    `json:"chunk_num"`
 }

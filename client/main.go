@@ -3,8 +3,10 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/md5"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -226,8 +228,12 @@ func (sc *ServiceClient) handleRequests() {
 			break
 		}
 
+		// Hash the received JSON message
+		msgHash := md5.Sum(rawMsg)
+		msgHashStr := hex.EncodeToString(msgHash[:])
+
 		err = json.Unmarshal(rawMsg, &baseReq)
-		log.Printf("Received RawMsg ID = %s, ChunkNum = %d, Type = %s", baseReq.ID, baseReq.ChunkNum, baseReq.Type)
+		log.Printf("CLIENT: Received ID=%s, ChunkNum=%d, Type=%s, json_md5=%s", baseReq.ID, baseReq.ChunkNum, baseReq.Type, msgHashStr)
 		if err != nil {
 			log.Printf("Failed to parse base message: %v", err)
 			continue
